@@ -16,7 +16,7 @@ function App() {
   // 🔁 حالة اللغة: en أو ar
   const [lang, setLang] = useState("en");
 
-  const API_BASE = "http://127.0.0.1:8000";
+  const API_BASE = "https://ai-study-assistant-j5eu.onrender.com";
 
   // دالة ترجمة بسيطة
   const t = (key) => {
