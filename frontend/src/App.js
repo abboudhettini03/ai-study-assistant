@@ -1,4 +1,5 @@
-import React, { useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
+
 
 function App() {
   const [file, setFile] = useState(null);
@@ -16,6 +17,11 @@ function App() {
   const [docId, setDocId] = useState("");
   const [chatInput, setChatInput] = useState("");
   const [chatMessages, setChatMessages] = useState([]); // [{role, content}]
+  const [isTyping, setIsTyping] = useState(false);
+  const chatEndRef = useRef(null);
+
+
+
 
 
   
@@ -159,6 +165,11 @@ function App() {
     return dict[key]?.[lang] || key;
   };
 
+  useEffect(() => {
+  chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+}, [chatMessages, isTyping]);
+
+
   const handleFileChange = (e) => {
     setFile(e.target.files[0]);
     setError("");
@@ -290,43 +301,54 @@ const handleUpload = async () => {
     }
   };
 
-    const handleChatSend = async () => {
-    if (!docId) {
-      setError(lang === "ar" ? "ارفع ملف PDF أولاً." : "Upload a PDF first.");
-      return;
-    }
-    if (!chatInput.trim()) return;
+const handleChatSend = async () => {
+  const msg = chatInput.trim();
 
-    const userMsg = { role: "user", content: chatInput.trim() };
-    setChatMessages((prev) => [...prev, userMsg]);
-    setChatInput("");
+  if (!docId) {
+    setError(lang === "ar" ? "ارفع ملف PDF أولاً ثم اسأل." : "Upload a PDF first, then ask.");
+    return;
+  }
+  if (!msg) return;
+  if (loadingAction === "chat") return;
 
-    setLoadingAction("chat");
-    setError("");
+  const userMsg = { role: "user", content: msg };
+  setChatMessages((prev) => [...prev, userMsg]);
+  setChatInput("");
 
-    try {
-      const res = await fetch(`${API_BASE}/chat`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          doc_id: docId,
-          message: userMsg.content,
-        }),
-      });
+  setLoadingAction("chat");
+  setIsTyping(true);
+  setError("");
 
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.detail || "Chat failed.");
-      }
+  try {
+    const res = await fetch(`${API_BASE}/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        doc_id: docId,
+        message: msg,
+      }),
+    });
 
-      const botMsg = { role: "assistant", content: data.answer || "No answer." };
-      setChatMessages((prev) => [...prev, botMsg]);
-    } catch (err) {
-      setError(err.message || "Chat error.");
-    } finally {
-      setLoadingAction(null);
-    }
-  };
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail || "Chat failed.");
+
+    const botMsg = { role: "assistant", content: data.answer || "No answer." };
+    setChatMessages((prev) => [...prev, botMsg]);
+  } catch (err) {
+    setError(err?.message || (lang === "ar" ? "حدث خطأ في الشات." : "Chat error."));
+  } finally {
+    setIsTyping(false);
+    setLoadingAction(null);
+  }
+};
+
+
+  const handleClearChat = () => {
+  setChatMessages([]);
+  setChatInput("");
+  setError("");
+};
+
 
 
   // 📥 زر تحميل ملف نصي يجمع الثلاثة
@@ -741,25 +763,43 @@ const handleUpload = async () => {
             )}
           </div>
 
+          {isTyping && (
+            <div style={{ opacity: 0.7, fontSize: "13px", marginBottom: "10px" }}>
+              {lang === "ar" ? "المساعد يكتب..." : "Assistant is typing..."}
+            </div>
+          )}
+
+<div ref={chatEndRef} />
+
           <div style={{ marginTop: "10px", display: "flex", gap: "8px", flexWrap: "wrap" }}>
-            <input
-              value={chatInput}
-              onChange={(e) => setChatInput(e.target.value)}
-              placeholder={lang === "ar" ? "اكتب سؤالك هنا..." : "Type your question..."}
-              style={{
-                flex: "1 1 320px",
-                padding: "10px",
-                borderRadius: "999px",
-                border: "1px solid #4b5563",
-                background: "#020617",
-                color: "#e5e7eb",
-                fontSize: "13px",
-                outline: "none",
-              }}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") handleChatSend();
-              }}
-            />
+              <textarea
+                value={chatInput}
+                onChange={(e) => setChatInput(e.target.value)}
+                placeholder={
+                  lang === "ar"
+                    ? "اكتب سؤالك هنا... (Enter لإرسال، Shift+Enter لسطر جديد)"
+                    : "Type your question... (Enter to send, Shift+Enter for new line)"
+                }
+                style={{
+                  flex: "1 1 320px",
+                  padding: "10px 14px",
+                  borderRadius: "16px",
+                  border: "1px solid #4b5563",
+                  background: "#020617",
+                  color: "#e5e7eb",
+                  fontSize: "13px",
+                  outline: "none",
+                  minHeight: "44px",
+                  resize: "vertical",
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    handleChatSend();
+                  }
+                }}
+                disabled={loadingAction === "chat"}
+              />
 
             <button
               onClick={handleChatSend}
@@ -779,7 +819,26 @@ const handleUpload = async () => {
                 ? (lang === "ar" ? "جاري..." : "Sending...")
                 : (lang === "ar" ? "إرسال" : "Send")}
             </button>
-          </div>
+
+            <button
+              onClick={handleClearChat}
+              disabled={chatMessages.length === 0 && !chatInput}
+              style={{
+                background: "transparent",
+                border: "1px solid #4b5563",
+                padding: "10px 14px",
+                borderRadius: "999px",
+                cursor: "pointer",
+                fontWeight: 700,
+                fontSize: "13px",
+                opacity: chatMessages.length === 0 && !chatInput ? 0.5 : 1,
+                color: "#e5e7eb",
+              }}
+            >
+              {lang === "ar" ? "مسح" : "Clear"}
+            </button>
+
+          </div> 
         </div>
 
 
