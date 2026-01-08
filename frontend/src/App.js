@@ -13,6 +13,16 @@ function App() {
   const [numQuestions, setNumQuestions] = useState(5);
   const [numCards, setNumCards] = useState(6);
 
+  const [docId, setDocId] = useState("");
+  const [chatInput, setChatInput] = useState("");
+  const [chatMessages, setChatMessages] = useState([]); // [{role, content}]
+
+
+  
+
+
+
+
   // 🔁 حالة اللغة: en أو ar
   const [lang, setLang] = useState("en");
 
@@ -157,39 +167,44 @@ function App() {
     setFlashcards("");
   };
 
-  const handleUpload = async () => {
-    if (!file) {
-      setError(t("errorChoosePDF"));
-      return;
+const handleUpload = async () => {
+  if (!file) {
+    setError(t("errorChoosePDF"));
+    return;
+  }
+
+  setLoadingAction("upload");
+  setError("");
+
+  try {
+    const formData = new FormData();
+    formData.append("file", file);
+
+    const res = await fetch(`${API_BASE}/upload`, {
+      method: "POST",
+      body: formData,
+    });
+
+    const data = await res.json();
+
+    if (!res.ok) {
+      throw new Error(data.detail || "Failed to upload file.");
     }
-    setLoadingAction("upload");
-    setError("");
-    try {
-      const formData = new FormData();
-      formData.append("file", file);
 
-      const res = await fetch(`${API_BASE}/upload`, {
-        method: "POST",
-        body: formData,
-      });
-
-      const data = await res.json();
-
-      if (!res.ok) {
-        throw new Error(data.detail || "Failed to upload file.");
-      }
-
-      if (!data.text || data.text.trim() === "") {
-        setError(data.message || "Could not extract text from PDF.");
-      } else {
-        setText(data.text);
-      }
-    } catch (err) {
-      setError(err.message || "Error uploading file.");
-    } finally {
-      setLoadingAction(null);
+    if (!data.text || data.text.trim() === "") {
+      setError(data.message || "Could not extract text from PDF.");
+    } else {
+      setText(data.text);
+      setDocId(data.doc_id); // ✅ مهم لـ Chat with PDF
+      setChatMessages([]);
     }
-  };
+  } catch (err) {
+    setError(err.message || "Error uploading file.");
+  } finally {
+    setLoadingAction(null);
+  }
+};
+
 
   const handleSummarize = async () => {
     if (!text.trim()) {
@@ -274,6 +289,45 @@ function App() {
       setLoadingAction(null);
     }
   };
+
+    const handleChatSend = async () => {
+    if (!docId) {
+      setError(lang === "ar" ? "ارفع ملف PDF أولاً." : "Upload a PDF first.");
+      return;
+    }
+    if (!chatInput.trim()) return;
+
+    const userMsg = { role: "user", content: chatInput.trim() };
+    setChatMessages((prev) => [...prev, userMsg]);
+    setChatInput("");
+
+    setLoadingAction("chat");
+    setError("");
+
+    try {
+      const res = await fetch(`${API_BASE}/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          doc_id: docId,
+          message: userMsg.content,
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.detail || "Chat failed.");
+      }
+
+      const botMsg = { role: "assistant", content: data.answer || "No answer." };
+      setChatMessages((prev) => [...prev, botMsg]);
+    } catch (err) {
+      setError(err.message || "Chat error.");
+    } finally {
+      setLoadingAction(null);
+    }
+  };
+
 
   // 📥 زر تحميل ملف نصي يجمع الثلاثة
   const handleDownload = () => {
@@ -633,6 +687,101 @@ function App() {
             }}
           />
         </div>
+
+
+                {/* Chat with PDF */}
+        <div
+          style={{
+            marginTop: "14px",
+            padding: "12px",
+            borderRadius: "14px",
+            border: "1px solid rgba(55,65,81,0.7)",
+            background:
+              "linear-gradient(135deg, rgba(15,23,42,0.95), rgba(15,23,42,0.7))",
+            textAlign: align,
+          }}
+        >
+          <div style={{ display: "flex", justifyContent: "space-between", gap: "10px", flexWrap: "wrap" }}>
+            <h2 style={{ margin: 0, fontSize: "14px", fontWeight: 700 }}>
+              {lang === "ar" ? "الدردشة مع ملف الـ PDF" : "Chat with the PDF"}
+            </h2>
+            <div style={{ fontSize: "12px", color: "#9ca3af" }}>
+              {docId ? (lang === "ar" ? "تم ربط الملف ✅" : "PDF linked ✅") : (lang === "ar" ? "ارفع PDF أولاً" : "Upload a PDF first")}
+            </div>
+          </div>
+
+          <div
+            style={{
+              marginTop: "10px",
+              height: "220px",
+              overflowY: "auto",
+              padding: "10px",
+              borderRadius: "12px",
+              border: "1px solid #4b5563",
+              background: "#020617",
+              fontSize: "13px",
+              whiteSpace: "pre-wrap",
+            }}
+          >
+            {chatMessages.length === 0 ? (
+              <div style={{ opacity: 0.6 }}>
+                {lang === "ar"
+                  ? "اسأل سؤالًا من محتوى الملف... مثال: ما الفكرة الرئيسية؟"
+                  : "Ask a question about the PDF... e.g., What is the main topic?"}
+              </div>
+            ) : (
+              chatMessages.map((m, idx) => (
+                <div key={idx} style={{ marginBottom: "10px" }}>
+                  <div style={{ fontSize: "12px", opacity: 0.7, marginBottom: "2px" }}>
+                    {m.role === "user" ? (lang === "ar" ? "أنت" : "You") : (lang === "ar" ? "المساعد" : "Assistant")}
+                  </div>
+                  <div style={{ lineHeight: 1.5 }}>{m.content}</div>
+                </div>
+              ))
+            )}
+          </div>
+
+          <div style={{ marginTop: "10px", display: "flex", gap: "8px", flexWrap: "wrap" }}>
+            <input
+              value={chatInput}
+              onChange={(e) => setChatInput(e.target.value)}
+              placeholder={lang === "ar" ? "اكتب سؤالك هنا..." : "Type your question..."}
+              style={{
+                flex: "1 1 320px",
+                padding: "10px",
+                borderRadius: "999px",
+                border: "1px solid #4b5563",
+                background: "#020617",
+                color: "#e5e7eb",
+                fontSize: "13px",
+                outline: "none",
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") handleChatSend();
+              }}
+            />
+
+            <button
+              onClick={handleChatSend}
+              disabled={loadingAction === "chat"}
+              style={{
+                background: "linear-gradient(135deg, #06b6d4, #0891b2, #0e7490)",
+                border: "none",
+                padding: "10px 16px",
+                borderRadius: "999px",
+                cursor: "pointer",
+                fontWeight: 700,
+                fontSize: "13px",
+                opacity: loadingAction === "chat" ? 0.7 : 1,
+              }}
+            >
+              {loadingAction === "chat"
+                ? (lang === "ar" ? "جاري..." : "Sending...")
+                : (lang === "ar" ? "إرسال" : "Send")}
+            </button>
+          </div>
+        </div>
+
 
         {/* Action buttons */}
         <div

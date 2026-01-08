@@ -5,7 +5,11 @@ from io import BytesIO
 import PyPDF2
 import os
 import requests
-
+# فوق: imports إضافية
+import uuid
+from typing import Dict, List
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
 app = FastAPI(
     title="AI Study Assistant API",
@@ -86,9 +90,16 @@ async def upload_pdf(file: UploadFile = File(...)):
     text = extract_text_from_pdf(content)
 
     if not text.strip():
-        return {"text": "", "message": "لم يتم استخراج أي نص من الملف. تأكد أن الـ PDF ليس عبارة عن صور فقط."}
+        return {"doc_id": "", "text": "", "message": "لم يتم استخراج أي نص من الملف. تأكد أن الـ PDF ليس عبارة عن صور فقط."}
 
-    return {"text": text}
+    doc_id = str(uuid.uuid4())
+    DOC_STORE[doc_id] = text
+
+    chunks = chunk_text(text)
+    CHUNK_STORE[doc_id] = chunks
+    build_tfidf_index(doc_id, chunks)
+
+    return {"doc_id": doc_id, "text": text}
 
 # ====== تلخيص ======
 @app.post("/summarize")
@@ -145,3 +156,58 @@ Text:
 @app.get("/")
 async def root():
     return {"message": "AI Study Assistant API is running ✅"}
+DOC_STORE: Dict[str, str] = {}
+CHUNK_STORE: Dict[str, List[str]] = {}
+VEC_STORE: Dict[str, dict] = {}  # {doc_id: {"vectorizer": ..., "matrix": ...}}
+
+def chunk_text(text: str, chunk_size: int = 1200, overlap: int = 200) -> List[str]:
+    text = text.replace("\r", "")
+    chunks = []
+    i = 0
+    while i < len(text):
+        chunk = text[i:i+chunk_size]
+        chunks.append(chunk)
+        i += max(1, chunk_size - overlap)
+    return chunks
+
+def build_tfidf_index(doc_id: str, chunks: List[str]):
+    vectorizer = TfidfVectorizer(stop_words=None)
+    matrix = vectorizer.fit_transform(chunks)
+    VEC_STORE[doc_id] = {"vectorizer": vectorizer, "matrix": matrix}
+
+def retrieve_chunks(doc_id: str, query: str, k: int = 5) -> List[str]:
+    data = VEC_STORE.get(doc_id)
+    if not data:
+        return []
+    vectorizer = data["vectorizer"]
+    matrix = data["matrix"]
+    q = vectorizer.transform([query])
+    sims = cosine_similarity(q, matrix).flatten()
+    top_idx = sims.argsort()[::-1][:k]
+    return [CHUNK_STORE[doc_id][i] for i in top_idx]
+
+class ChatRequest(BaseModel):
+    doc_id: str
+    message: str
+    history: list = []  # optional [{"role":"user/assistant","content":"..."}]
+
+@app.post("/chat")
+async def chat_with_pdf(req: ChatRequest):
+    if req.doc_id not in DOC_STORE:
+        return {"answer": "Invalid doc_id. Upload a PDF first."}
+
+    context_chunks = retrieve_chunks(req.doc_id, req.message, k=5)
+    context = "\n\n---\n\n".join(context_chunks)
+
+    prompt = f"""
+You are a helpful AI assistant. Answer the user's question using ONLY the provided PDF context.
+If the answer isn't in the context, say you couldn't find it in the PDF.
+
+PDF Context:
+{context}
+
+User Question:
+{req.message}
+"""
+    answer = call_llm(prompt)
+    return {"answer": answer}
