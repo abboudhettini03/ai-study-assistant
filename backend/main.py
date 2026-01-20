@@ -15,7 +15,7 @@ from sklearn.metrics.pairwise import cosine_similarity  # type: ignore
 app = FastAPI(
     title="AI Study Assistant API",
     description="Backend for summarizing PDFs, generating questions, flashcards, and chatting with PDFs.",
-    version="2.0.1",
+    version="2.2.0",
 )
 
 # ====== CORS ======
@@ -28,11 +28,22 @@ app.add_middleware(
 )
 
 # ====== Stores ======
-DOC_STORE: Dict[str, str] = {}                    # doc_id -> full text
-PAGE_STORE: Dict[str, List[str]] = {}             # doc_id -> pages text
-CHUNK_STORE: Dict[str, List[Dict[str, Any]]] = {} # doc_id -> [{"text":..., "page":...}]
-VEC_STORE: Dict[str, dict] = {}                   # doc_id -> {"vectorizer":..., "matrix":...}
-DOC_META: Dict[str, Dict[str, Any]] = {}          # doc_id -> {"filename":..., "num_pages":...}
+DOC_STORE: Dict[str, str] = {}                     # doc_id -> full text
+PAGE_STORE: Dict[str, List[str]] = {}              # doc_id -> pages text
+CHUNK_STORE: Dict[str, List[Dict[str, Any]]] = {}  # doc_id -> [{"text":..., "page":...}]
+VEC_STORE: Dict[str, dict] = {}                    # doc_id -> {"vectorizer":..., "matrix":...}
+DOC_META: Dict[str, Dict[str, Any]] = {}           # doc_id -> {"filename":..., "num_pages":...}
+
+
+# ====== Helpers ======
+def detect_lang(text: str) -> str:
+    """If Arabic chars exist => ar else en."""
+    try:
+        if any("\u0600" <= c <= "\u06FF" for c in (text or "")):
+            return "ar"
+    except Exception:
+        pass
+    return "en"
 
 
 # ====== PDF Extraction (Page-aware) ======
@@ -63,7 +74,7 @@ def chunk_pages(pages: List[str], chunk_size: int = 1200, overlap: int = 200) ->
 
 
 def build_tfidf_index(doc_id: str, chunks: List[Dict[str, Any]]) -> None:
-    texts = [c["text"] for c in chunks]
+    texts = [c.get("text", "") for c in chunks]
     vectorizer = TfidfVectorizer(stop_words=None)
     matrix = vectorizer.fit_transform(texts)
     VEC_STORE[doc_id] = {"vectorizer": vectorizer, "matrix": matrix}
@@ -91,7 +102,7 @@ def retrieve_chunks_for_doc(doc_id: str, query: str, k: int = 5) -> List[Dict[st
         score = float(sims[i_int])
         results.append(
             {
-                "id": f"S{rank}",  # per-doc temporary label
+                "id": f"S{rank}",  # temporary per-doc label
                 "doc_id": doc_id,
                 "score": score,
                 "text": chunk_obj.get("text", ""),
@@ -102,10 +113,6 @@ def retrieve_chunks_for_doc(doc_id: str, query: str, k: int = 5) -> List[Dict[st
 
 
 def merge_retrieval(doc_ids: List[str], query: str, top_k_total: int = 7, k_per_doc: int = 5) -> List[Dict[str, Any]]:
-    """
-    Retrieve per document then merge by score, return top_k_total overall.
-    Re-label sources as S1..Sn across merged list.
-    """
     all_hits: List[Dict[str, Any]] = []
     for did in doc_ids:
         all_hits.extend(retrieve_chunks_for_doc(did, query, k=k_per_doc))
@@ -132,17 +139,39 @@ def call_llm(prompt: str) -> str:
             {"role": "system", "content": "You are a helpful AI study assistant."},
             {"role": "user", "content": prompt},
         ],
-        "max_tokens": 500,
-        "temperature": 0.4,
+        "max_tokens": 650,
+        "temperature": 0.35,
     }
 
     try:
-        res = requests.post(url, headers=headers, json=body, timeout=60)
+        res = requests.post(url, headers=headers, json=body, timeout=75)
         res.raise_for_status()
         data = res.json()
         return data["choices"][0]["message"]["content"]
     except Exception as e:
         return f"LLM Error: {str(e)}"
+
+
+def translate_to_english_if_needed(text: str) -> str:
+    """
+    If the input looks Arabic, translate it to English for retrieval.
+    """
+    try:
+        if detect_lang(text) == "ar":
+            prompt = f"""
+Translate the following question to English.
+Return ONLY the translated question.
+
+Question:
+{text}
+"""
+            translated = (call_llm(prompt) or "").strip()
+            if (not translated) or translated.startswith("LLM Error"):
+                return text
+            return translated
+        return text
+    except Exception:
+        return text
 
 
 # ====== Request Models ======
@@ -162,17 +191,17 @@ class FlashcardsRequest(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    # Multi-doc support: send doc_ids; if empty, fallback to doc_id
     doc_ids: List[str] = Field(default_factory=list)
     doc_id: Optional[str] = None
 
     message: str
     mode: str = "strict"  # "strict" | "simple" | "exam"
+    lang: str = "auto"    # "auto" | "ar" | "en"
 
     history: List[Dict[str, str]] = Field(default_factory=list)
 
 
-# ====== Upload (single) ======
+# ====== Upload ======
 @app.post("/upload")
 async def upload_pdf(file: UploadFile = File(...)):
     content = await file.read()
@@ -201,7 +230,7 @@ async def upload_pdf(file: UploadFile = File(...)):
     return {"doc_id": doc_id, "text": full_text, "filename": filename, "num_pages": num_pages}
 
 
-# ====== Summarize ======
+# ====== Summarize / Questions / Flashcards ======
 @app.post("/summarize")
 async def summarize(req: SummaryRequest):
     prompt = f"""
@@ -215,7 +244,6 @@ Text:
     return {"summary": summary}
 
 
-# ====== Questions ======
 @app.post("/generate-questions")
 async def generate_questions(req: QuestionsRequest):
     prompt = f"""
@@ -235,7 +263,6 @@ Text:
     return {"questions": questions}
 
 
-# ====== Flashcards ======
 @app.post("/generate-flashcards")
 async def generate_flashcards(req: FlashcardsRequest):
     prompt = f"""
@@ -256,68 +283,77 @@ def build_mode_instructions(mode: str) -> str:
     mode = (mode or "strict").strip().lower()
     if mode == "simple":
         return (
-            "Mode: SIMPLE EXPLANATION.\n"
+            "MODE: SIMPLE.\n"
             "- Explain in very simple terms.\n"
             "- Use short sentences.\n"
             "- Give a tiny example if possible.\n"
-            "- Still ONLY use PDF context.\n"
+            "- Use ONLY the PDF context.\n"
         )
     if mode == "exam":
         return (
-            "Mode: EXAM-READY.\n"
+            "MODE: EXAM.\n"
             "- Answer like a model exam answer.\n"
-            "- Use structured points (definitions, steps, key terms).\n"
-            "- Still ONLY use PDF context.\n"
+            "- Use structured points (definition → key ideas → steps → notes).\n"
+            "- Use ONLY the PDF context.\n"
         )
     return (
-        "Mode: STRICT PDF.\n"
+        "MODE: STRICT.\n"
         "- Answer ONLY from the provided PDF context.\n"
         "- If missing, say you couldn't find it in the PDF.\n"
     )
 
 
-def translate_to_english_if_needed(text: str) -> str:
+def build_output_rules(answer_lang: str) -> str:
     """
-    If the input looks Arabic, translate it to English for retrieval.
-    Safe fallback if LLM fails.
+    Critical: DO NOT include "Sources" section in the answer body.
+    Because the UI already shows sources in cards (avoids RTL/LTR mess).
     """
-    try:
-        if any("\u0600" <= c <= "\u06FF" for c in text):
-            prompt = f"""
-Translate the following question to English.
-Return ONLY the translated question.
+    if answer_lang == "ar":
+        return (
+            "OUTPUT RULES (Arabic):\n"
+            "- اكتب الإجابة بالعربية فقط.\n"
+            "- ابدأ بسطر عنوان قصير.\n"
+            "- ثم نقاط مرتبة (•) من 3 إلى 7 نقاط.\n"
+            "- داخل النقاط استخدم الاستشهادات فقط بهذه الصيغة: [S1] أو [S2].\n"
+            "- ممنوع كتابة كلمة Page أو رقم الصفحة داخل الجملة.\n"
+            "- ممنوع إضافة قسم بعنوان (المصادر) داخل الإجابة.\n"
+        )
+    return (
+        "OUTPUT RULES (English):\n"
+        "- Answer in English only.\n"
+        "- Start with a short heading line.\n"
+        "- Then 3–7 bullet points (•).\n"
+        "- Cite inside bullets using [S1], [S2] only.\n"
+        "- Do NOT write 'Page' inside bullets.\n"
+        "- Do NOT add a 'Sources' section in the answer.\n"
+    )
 
-Question:
-{text}
-"""
-            translated = call_llm(prompt).strip()
-            if not translated or translated.startswith("LLM Error"):
-                return text
-            return translated
-        return text
-    except Exception:
-        return text
 
-
-# ====== Chat (multi-pdf + pages + modes) ======
+# ====== Chat ======
 @app.post("/chat")
 async def chat_with_pdf(req: ChatRequest):
-    # Determine doc_ids
     doc_ids = req.doc_ids if req.doc_ids else ([req.doc_id] if req.doc_id else [])
     doc_ids = [d for d in doc_ids if d and d in DOC_STORE]
 
     if not doc_ids:
-        return {"answer": "No valid doc_id(s). Upload a PDF first.", "sources": []}
+        return {"answer": "No valid doc_id(s). Upload a PDF first.", "sources": [], "answer_lang": "en"}
+
+    user_lang = detect_lang(req.message)
+    answer_lang = (req.lang or "auto").strip().lower()
+    if answer_lang not in ("auto", "ar", "en"):
+        answer_lang = "auto"
+    if answer_lang == "auto":
+        answer_lang = user_lang
 
     retrieval_query = translate_to_english_if_needed(req.message)
 
-    # ✅ FIX: use merge_retrieval (multi-pdf) instead of missing retrieve_chunks
     retrieved = merge_retrieval(doc_ids, retrieval_query, top_k_total=7, k_per_doc=5)
 
-    if not retrieved or retrieved[0]["score"] < 0.05:
-        return {"answer": "I couldn't find relevant content in the selected PDF(s).", "sources": []}
+    if (not retrieved) or (retrieved[0].get("score", 0.0) < 0.05):
+        if answer_lang == "ar":
+            return {"answer": "لم أجد محتوى مناسبًا داخل الـ PDF(s) المحددة للإجابة على سؤالك.", "sources": [], "answer_lang": "ar"}
+        return {"answer": "I couldn't find relevant content in the selected PDF(s).", "sources": [], "answer_lang": "en"}
 
-    # Context with source + file + page
     numbered_context = []
     for item in retrieved:
         meta = DOC_META.get(item["doc_id"], {})
@@ -327,7 +363,6 @@ async def chat_with_pdf(req: ChatRequest):
         )
     context = "\n\n---\n\n".join(numbered_context)
 
-    # history (last 6)
     history_text = ""
     if req.history:
         last = req.history[-6:]
@@ -340,16 +375,19 @@ async def chat_with_pdf(req: ChatRequest):
         history_text = "\n".join(lines)
 
     mode_instructions = build_mode_instructions(req.mode)
+    out_rules = build_output_rules(answer_lang)
 
     prompt = f"""
 You are a helpful AI assistant.
 
 {mode_instructions}
+{out_rules}
 
 Rules:
-- Cite sources like (S1), (S2) when stating facts.
-- Mention page when helpful, e.g. Page 3 (S2).
-- Keep the answer focused.
+- Use ONLY the PDF context below.
+- If the answer isn't in the context, say so clearly.
+- Do NOT invent sources.
+- Keep it clean and well-structured.
 
 Conversation (optional):
 {history_text}
@@ -360,7 +398,7 @@ PDF Context:
 User Question:
 {req.message}
 """
-    answer = call_llm(prompt)
+    answer = (call_llm(prompt) or "").strip()
 
     sources = []
     for item in retrieved:
@@ -370,13 +408,13 @@ User Question:
                 "id": item["id"],
                 "doc_id": item["doc_id"],
                 "filename": meta.get("filename", ""),
-                "page": item["page"],
-                "score": item["score"],
-                "excerpt": item["text"][:350].replace("\n", " ").strip(),
+                "page": int(item.get("page", 0) or 0),
+                "score": float(item.get("score", 0.0) or 0.0),
+                "excerpt": (item.get("text", "")[:350]).replace("\n", " ").strip(),
             }
         )
 
-    return {"answer": answer, "sources": sources}
+    return {"answer": answer, "sources": sources, "answer_lang": answer_lang}
 
 
 @app.get("/")
