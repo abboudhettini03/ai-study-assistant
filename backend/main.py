@@ -6,7 +6,7 @@ import PyPDF2  # type: ignore
 import os
 import requests  # type: ignore
 import uuid
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional
 
 from sklearn.feature_extraction.text import TfidfVectorizer  # type: ignore
 from sklearn.metrics.pairwise import cosine_similarity  # type: ignore
@@ -15,7 +15,7 @@ from sklearn.metrics.pairwise import cosine_similarity  # type: ignore
 app = FastAPI(
     title="AI Study Assistant API",
     description="Backend for summarizing PDFs, generating questions, flashcards, and chatting with PDFs.",
-    version="2.0.0",
+    version="2.0.1",
 )
 
 # ====== CORS ======
@@ -85,15 +85,17 @@ def retrieve_chunks_for_doc(doc_id: str, query: str, k: int = 5) -> List[Dict[st
     results: List[Dict[str, Any]] = []
     for rank, i in enumerate(top_idx, start=1):
         i_int = int(i)
+        if i_int < 0 or i_int >= len(chunks):
+            continue
         chunk_obj = chunks[i_int]
         score = float(sims[i_int])
         results.append(
             {
-                "id": f"S{rank}",  # temporary per-doc; we will re-label later after merging
+                "id": f"S{rank}",  # per-doc temporary label
                 "doc_id": doc_id,
                 "score": score,
-                "text": chunk_obj["text"],
-                "page": int(chunk_obj["page"]),
+                "text": chunk_obj.get("text", ""),
+                "page": int(chunk_obj.get("page", 0) or 0),
             }
         )
     return results
@@ -108,11 +110,9 @@ def merge_retrieval(doc_ids: List[str], query: str, top_k_total: int = 7, k_per_
     for did in doc_ids:
         all_hits.extend(retrieve_chunks_for_doc(did, query, k=k_per_doc))
 
-    # Sort by score descending
     all_hits.sort(key=lambda x: x.get("score", 0.0), reverse=True)
     merged = all_hits[:top_k_total]
 
-    # Re-label globally S1..Sn
     for idx, item in enumerate(merged, start=1):
         item["id"] = f"S{idx}"
     return merged
@@ -269,30 +269,34 @@ def build_mode_instructions(mode: str) -> str:
             "- Use structured points (definitions, steps, key terms).\n"
             "- Still ONLY use PDF context.\n"
         )
-    # default strict
     return (
         "Mode: STRICT PDF.\n"
         "- Answer ONLY from the provided PDF context.\n"
         "- If missing, say you couldn't find it in the PDF.\n"
     )
 
+
 def translate_to_english_if_needed(text: str) -> str:
     """
     If the input looks Arabic, translate it to English for retrieval.
+    Safe fallback if LLM fails.
     """
-    # فحص بسيط: هل فيه أحرف عربية؟
-    if any("\u0600" <= c <= "\u06FF" for c in text):
-        prompt = f"""
+    try:
+        if any("\u0600" <= c <= "\u06FF" for c in text):
+            prompt = f"""
 Translate the following question to English.
 Return ONLY the translated question.
 
 Question:
 {text}
 """
-        translated = call_llm(prompt)
-        return translated.strip()
-    return text
-
+            translated = call_llm(prompt).strip()
+            if not translated or translated.startswith("LLM Error"):
+                return text
+            return translated
+        return text
+    except Exception:
+        return text
 
 
 # ====== Chat (multi-pdf + pages + modes) ======
@@ -306,10 +310,10 @@ async def chat_with_pdf(req: ChatRequest):
         return {"answer": "No valid doc_id(s). Upload a PDF first.", "sources": []}
 
     retrieval_query = translate_to_english_if_needed(req.message)
-    retrieved = retrieve_chunks(req.doc_id, retrieval_query, k=5) # type: ignore
 
+    # ✅ FIX: use merge_retrieval (multi-pdf) instead of missing retrieve_chunks
+    retrieved = merge_retrieval(doc_ids, retrieval_query, top_k_total=7, k_per_doc=5)
 
-    # Threshold: if best score is too low, say not found
     if not retrieved or retrieved[0]["score"] < 0.05:
         return {"answer": "I couldn't find relevant content in the selected PDF(s).", "sources": []}
 
