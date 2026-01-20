@@ -276,6 +276,24 @@ def build_mode_instructions(mode: str) -> str:
         "- If missing, say you couldn't find it in the PDF.\n"
     )
 
+def translate_to_english_if_needed(text: str) -> str:
+    """
+    If the input looks Arabic, translate it to English for retrieval.
+    """
+    # فحص بسيط: هل فيه أحرف عربية؟
+    if any("\u0600" <= c <= "\u06FF" for c in text):
+        prompt = f"""
+Translate the following question to English.
+Return ONLY the translated question.
+
+Question:
+{text}
+"""
+        translated = call_llm(prompt)
+        return translated.strip()
+    return text
+
+
 
 # ====== Chat (multi-pdf + pages + modes) ======
 @app.post("/chat")
@@ -287,7 +305,9 @@ async def chat_with_pdf(req: ChatRequest):
     if not doc_ids:
         return {"answer": "No valid doc_id(s). Upload a PDF first.", "sources": []}
 
-    retrieved = merge_retrieval(doc_ids, req.message, top_k_total=7, k_per_doc=5)
+    retrieval_query = translate_to_english_if_needed(req.message)
+    retrieved = retrieve_chunks(req.doc_id, retrieval_query, k=5) # type: ignore
+
 
     # Threshold: if best score is too low, say not found
     if not retrieved or retrieved[0]["score"] < 0.05:
