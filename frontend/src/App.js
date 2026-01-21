@@ -463,26 +463,31 @@ function App() {
       });
     };
 
-    const finalize = () => {
-      const botMsg = {
-        role: "assistant",
-        content: accumulated,
-        sources: finalSources,
-        lang: finalAnswerLang,
-        pending: false,
-      };
+    let finalized = false;
 
-      setChatMessages((prev) => {
-        const next = [...prev];
-        for (let i = next.length - 1; i >= 0; i--) {
-          if (next[i]?.pending) {
-            next[i] = botMsg;
-            return next;
-          }
-        }
-        return [...next, botMsg];
-      });
-    };
+    const finalize = () => {
+  if (finalized) return;
+  finalized = true;
+  const botMsg = {
+    role: "assistant",
+    content: accumulated,
+    sources: finalSources,
+    lang: finalAnswerLang,
+    pending: false,
+  };
+
+  setChatMessages((prev) => {
+    const next = [...prev];
+    for (let i = next.length - 1; i >= 0; i--) {
+      if (next[i]?.pending) {
+        next[i] = botMsg;
+        return next;
+      }
+    }
+    return [...next, botMsg];
+  });
+};
+
 
     const handleEventBlock = (block) => {
       const lines = block.split("\n");
@@ -542,7 +547,8 @@ function App() {
     }
 
     // لو انتهى الستريم بدون "done"
-    finalize();
+    if (!finalized) finalize();
+
 
     setTab("chat");
     pushToast("success", t("Answer ready.", "تمت الإجابة."));
@@ -1137,7 +1143,7 @@ function ChatBubble({ role, content, sources, dir, uiLang, pending, onOpenPrevie
         </div>
 
         <div className="bubbleContent">
-          {pending ? (
+          {pending && !(content || "").trim() ? (
             <div className="bubbleSkeleton">
               <div className="skLineOut" />
               <div className="skLineOut" style={{ width: "88%" }} />
