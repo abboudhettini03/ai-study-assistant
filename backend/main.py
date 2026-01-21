@@ -9,11 +9,11 @@ import requests  # type: ignore
 import uuid
 from typing import Dict, List, Any, Optional
 from datetime import datetime
-
+import asyncio
 from fastapi.responses import StreamingResponse
 import json
-import time
 from typing import Dict, Any
+
 
 import re
 from collections import defaultdict
@@ -80,6 +80,17 @@ app = FastAPI(
     version="3.1.0",
     docs_url="/api-docs",
     redoc_url="/redoc",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://ai-study-assistant-nu.vercel.app/",  # عدّل لو اسم مشروعك مختلف
+        "http://localhost:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -721,19 +732,29 @@ async def chat_stream(req: ChatRequest):
     sources = result.get("sources", [])
     answer_lang = result.get("answer_lang", "en")
 
-    def gen():
+    async def gen():   # 🔴 مهم: async def
         yield f"event: meta\ndata: {json.dumps({'answer_lang': answer_lang})}\n\n"
 
         chunk_size = 80
         for i in range(0, len(answer), chunk_size):
             part = answer[i:i+chunk_size]
             yield f"event: delta\ndata: {json.dumps({'text': part})}\n\n"
-            time.sleep(0.01)
+            await asyncio.sleep(0.01)   # ✅ هنا التعديل
 
         yield f"event: sources\ndata: {json.dumps({'sources': sources})}\n\n"
         yield "event: done\ndata: {}\n\n"
 
-    return StreamingResponse(gen(), media_type="text/event-stream")
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 
 
 @app.get("/")
