@@ -391,65 +391,87 @@ function App() {
   };
 
   const handleChatSend = async () => {
-    const msg = chatInput.trim();
-    if (!msg) return;
+  const msg = chatInput.trim();
+  if (!msg) return;
 
-    if (selectedDocIds.length === 0) {
-      setError(t("Select at least one PDF first.", "اختر ملف PDF واحد على الأقل أولاً."));
-      pushToast("error", t("Select PDFs first.", "اختر ملفات أولاً."));
-      return;
-    }
-    if (loadingAction === "chat") return;
+  if (selectedDocIds.length === 0) {
+    setError(t("Select at least one PDF first.", "اختر ملف PDF واحد على الأقل أولاً."));
+    pushToast("error", t("Select PDFs first.", "اختر ملفات أولاً."));
+    return;
+  }
+  if (loadingAction === "chat") return;
 
-    const userLang = hasArabic(msg) ? "ar" : "en";
-    const userMsg = { role: "user", content: msg, sources: [], lang: userLang };
+  const userLang = hasArabic(msg) ? "ar" : "en";
+  const userMsg = { role: "user", content: msg, sources: [], lang: userLang };
 
-    // add user + pending assistant skeleton bubble
-    const pendingBot = {
-      role: "assistant",
-      content: "",
-      sources: [],
-      lang: uiLang === "ar" ? "ar" : "en",
-      pending: true,
+  // add user + pending assistant skeleton bubble
+  const pendingBot = {
+    role: "assistant",
+    content: "",
+    sources: [],
+    lang: uiLang === "ar" ? "ar" : "en",
+    pending: true,
+  };
+
+  setChatMessages((prev) => [...prev, userMsg, pendingBot]);
+  setChatInput("");
+
+  setLoadingAction("chat");
+  setIsTyping(true);
+  setError("");
+
+  try {
+    const payload = {
+      doc_ids: selectedDocIds,
+      message: msg,
+      mode,
+      lang: "auto",
+      history: buildHistoryPayload([...chatMessages, userMsg]),
     };
 
-    setChatMessages((prev) => [...prev, userMsg, pendingBot]);
-    setChatInput("");
+    const res = await fetch(`${API_BASE}/chat-stream`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
 
-    setLoadingAction("chat");
-    setIsTyping(true);
-    setError("");
+    if (!res.ok) {
+      const txt = await res.text();
+      throw new Error((txt || "").slice(0, 200) || "Chat failed.");
+    }
 
-    try {
-      const payload = {
-        doc_ids: selectedDocIds,
-        message: msg,
-        mode,
-        lang: "auto",
-        history: buildHistoryPayload([...chatMessages, userMsg]),
-      };
+    if (!res.body) throw new Error("Streaming not supported by the browser.");
 
-      const res = await fetch(`${API_BASE}/chat`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+
+    let buffer = "";
+    let accumulated = "";
+    let finalAnswerLang = hasArabic(msg) ? "ar" : "en";
+    let finalSources = [];
+
+    const updatePending = (partialText, langGuess) => {
+      setChatMessages((prev) => {
+        const next = [...prev];
+        for (let i = next.length - 1; i >= 0; i--) {
+          if (next[i]?.pending) {
+            next[i] = { ...next[i], content: partialText, lang: langGuess || next[i].lang };
+            break;
+          }
+        }
+        return next;
       });
+    };
 
-      const data = await res.json();
-      if (!res.ok) throw new Error(data?.detail || "Chat failed.");
-
-      const answer = data?.answer || "";
-      const answerLang = data?.answer_lang || (hasArabic(answer) ? "ar" : "en");
-
+    const finalize = () => {
       const botMsg = {
         role: "assistant",
-        content: answer,
-        sources: data?.sources || [],
-        lang: answerLang,
+        content: accumulated,
+        sources: finalSources,
+        lang: finalAnswerLang,
         pending: false,
       };
 
-      // replace last pending bubble
       setChatMessages((prev) => {
         const next = [...prev];
         for (let i = next.length - 1; i >= 0; i--) {
@@ -460,18 +482,80 @@ function App() {
         }
         return [...next, botMsg];
       });
+    };
 
-      setTab("chat");
-      pushToast("success", t("Answer ready.", "تمت الإجابة."));
-    } catch (e) {
-      setError(e?.message || t("Chat error.", "خطأ في الدردشة."));
-      pushToast("error", e?.message || t("Chat error.", "خطأ في الدردشة."));
-      setChatMessages((prev) => prev.filter((m) => !m.pending));
-    } finally {
-      setIsTyping(false);
-      setLoadingAction(null);
+    const handleEventBlock = (block) => {
+      const lines = block.split("\n");
+      let eventName = "message";
+      let dataStr = "";
+
+      for (const line of lines) {
+        if (line.startsWith("event:")) eventName = line.replace("event:", "").trim();
+        if (line.startsWith("data:")) dataStr += line.replace("data:", "").trim();
+      }
+
+      if (!dataStr) return;
+
+      let obj = null;
+      try {
+        obj = JSON.parse(dataStr);
+      } catch {
+        obj = null;
+      }
+
+      if (eventName === "meta") {
+        if (obj?.answer_lang) finalAnswerLang = obj.answer_lang;
+        return;
+      }
+
+      if (eventName === "delta") {
+        const part = obj?.text || "";
+        accumulated += part;
+        updatePending(accumulated, finalAnswerLang);
+        return;
+      }
+
+      if (eventName === "sources") {
+        finalSources = obj?.sources || [];
+        return;
+      }
+
+      if (eventName === "done") {
+        finalize();
+        return;
+      }
+    };
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+
+      // SSE blocks separated by blank line
+      let idx;
+      while ((idx = buffer.indexOf("\n\n")) !== -1) {
+        const block = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 2);
+        if (block.trim()) handleEventBlock(block);
+      }
     }
-  };
+
+    // لو انتهى الستريم بدون "done"
+    finalize();
+
+    setTab("chat");
+    pushToast("success", t("Answer ready.", "تمت الإجابة."));
+  } catch (e) {
+    setError(e?.message || t("Chat error.", "خطأ في الدردشة."));
+    pushToast("error", e?.message || t("Chat error.", "خطأ في الدردشة."));
+    setChatMessages((prev) => prev.filter((m) => !m.pending));
+  } finally {
+    setIsTyping(false);
+    setLoadingAction(null);
+  }
+};
+
 
   const handleDeleteDoc = async (doc_id) => {
     const ok = window.confirm(t("Delete this PDF from library?", "حذف هذا الملف من المكتبة؟"));
