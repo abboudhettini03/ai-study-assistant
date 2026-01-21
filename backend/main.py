@@ -1,5 +1,6 @@
 from fastapi import FastAPI, UploadFile, File  # pyright: ignore[reportMissingImports]
 from fastapi.middleware.cors import CORSMiddleware  # type: ignore
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field  # type: ignore
 from io import BytesIO
 import PyPDF2  # type: ignore
@@ -7,21 +8,22 @@ import os
 import requests  # type: ignore
 import uuid
 from typing import Dict, List, Any, Optional
+from fastapi import HTTPException
 
 from sklearn.feature_extraction.text import TfidfVectorizer  # type: ignore
 from sklearn.metrics.pairwise import cosine_similarity  # type: ignore
 
 
 app = FastAPI(
-    title="AI Study Assistant API",
+    title="StudySpark AI API",
     description="Backend for summarizing PDFs, generating questions, flashcards, and chatting with PDFs.",
-    version="2.2.0",
+    version="3.0.0",
 )
 
 # ====== CORS ======
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # لاحقاً خصصها
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -33,6 +35,7 @@ PAGE_STORE: Dict[str, List[str]] = {}              # doc_id -> pages text
 CHUNK_STORE: Dict[str, List[Dict[str, Any]]] = {}  # doc_id -> [{"text":..., "page":...}]
 VEC_STORE: Dict[str, dict] = {}                    # doc_id -> {"vectorizer":..., "matrix":...}
 DOC_META: Dict[str, Dict[str, Any]] = {}           # doc_id -> {"filename":..., "num_pages":...}
+PDF_STORE: Dict[str, bytes] = {}                   # doc_id -> original pdf bytes (for preview)
 
 
 # ====== Helpers ======
@@ -67,7 +70,7 @@ def chunk_pages(pages: List[str], chunk_size: int = 1200, overlap: int = 200) ->
 
         i = 0
         while i < len(text):
-            chunk = text[i : i + chunk_size]
+            chunk = text[i: i + chunk_size]
             chunks.append({"text": chunk, "page": page_idx})
             i += max(1, chunk_size - overlap)
     return chunks
@@ -102,7 +105,7 @@ def retrieve_chunks_for_doc(doc_id: str, query: str, k: int = 5) -> List[Dict[st
         score = float(sims[i_int])
         results.append(
             {
-                "id": f"S{rank}",  # temporary per-doc label
+                "id": f"S{rank}",  # temp label; re-labeled after merge
                 "doc_id": doc_id,
                 "score": score,
                 "text": chunk_obj.get("text", ""),
@@ -139,7 +142,7 @@ def call_llm(prompt: str) -> str:
             {"role": "system", "content": "You are a helpful AI study assistant."},
             {"role": "user", "content": prompt},
         ],
-        "max_tokens": 650,
+        "max_tokens": 700,
         "temperature": 0.35,
     }
 
@@ -154,7 +157,7 @@ def call_llm(prompt: str) -> str:
 
 def translate_to_english_if_needed(text: str) -> str:
     """
-    If the input looks Arabic, translate it to English for retrieval.
+    If Arabic => translate for retrieval only.
     """
     try:
         if detect_lang(text) == "ar":
@@ -197,7 +200,6 @@ class ChatRequest(BaseModel):
     message: str
     mode: str = "strict"  # "strict" | "simple" | "exam"
     lang: str = "auto"    # "auto" | "ar" | "en"
-
     history: List[Dict[str, str]] = Field(default_factory=list)
 
 
@@ -219,6 +221,7 @@ async def upload_pdf(file: UploadFile = File(...)):
     filename = file.filename or "document.pdf"
     num_pages = len(pages)
 
+    PDF_STORE[doc_id] = content  # <-- for preview
     DOC_STORE[doc_id] = full_text
     PAGE_STORE[doc_id] = pages
     DOC_META[doc_id] = {"filename": filename, "num_pages": num_pages}
@@ -228,6 +231,29 @@ async def upload_pdf(file: UploadFile = File(...)):
     build_tfidf_index(doc_id, chunks)
 
     return {"doc_id": doc_id, "text": full_text, "filename": filename, "num_pages": num_pages}
+
+
+# ====== PDF Preview endpoint ======
+
+
+@app.get("/pdf/{doc_id}")
+async def get_pdf(doc_id: str):
+    pdf = PDF_STORE.get(doc_id)
+    if not pdf:
+        raise HTTPException(status_code=404, detail="PDF not found. Re-upload the PDF.")
+
+    meta = DOC_META.get(doc_id, {})
+    filename = meta.get("filename", "document.pdf")
+
+    return StreamingResponse(
+        BytesIO(pdf),
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'inline; filename="{filename}"',
+            "Cache-Control": "no-store",
+        },
+    )
+
 
 
 # ====== Summarize / Questions / Flashcards ======
@@ -303,29 +329,30 @@ def build_mode_instructions(mode: str) -> str:
     )
 
 
-def build_output_rules(answer_lang: str) -> str:
+def build_output_format(answer_lang: str) -> str:
     """
-    Critical: DO NOT include "Sources" section in the answer body.
-    Because the UI already shows sources in cards (avoids RTL/LTR mess).
+    Force stable Arabic formatting to avoid RTL/LTR mess.
+    Keep citations like [S1] in body; page/file in Sources section.
     """
     if answer_lang == "ar":
         return (
-            "OUTPUT RULES (Arabic):\n"
-            "- اكتب الإجابة بالعربية فقط.\n"
-            "- ابدأ بسطر عنوان قصير.\n"
-            "- ثم نقاط مرتبة (•) من 3 إلى 7 نقاط.\n"
-            "- داخل النقاط استخدم الاستشهادات فقط بهذه الصيغة: [S1] أو [S2].\n"
-            "- ممنوع كتابة كلمة Page أو رقم الصفحة داخل الجملة.\n"
-            "- ممنوع إضافة قسم بعنوان (المصادر) داخل الإجابة.\n"
+            "OUTPUT FORMAT (Arabic):\n"
+            "1) عنوان قصير: **الخلاصة**\n"
+            "2) نقاط مرتبة (•) من 3 إلى 7 نقاط.\n"
+            "3) داخل النقاط: استخدم [S1] أو [S2] فقط (بدون كلمة Page داخل الجملة).\n"
+            "4) في النهاية: **المصادر**\n"
+            "5) كل سطر:\n"
+            "   - S1 — صفحة 9 — Handout-2.pdf\n"
+            "مهم: لا تضع رقم الصفحة داخل الجملة العربية.\n"
         )
     return (
-        "OUTPUT RULES (English):\n"
-        "- Answer in English only.\n"
-        "- Start with a short heading line.\n"
-        "- Then 3–7 bullet points (•).\n"
-        "- Cite inside bullets using [S1], [S2] only.\n"
-        "- Do NOT write 'Page' inside bullets.\n"
-        "- Do NOT add a 'Sources' section in the answer.\n"
+        "OUTPUT FORMAT (English):\n"
+        "1) Heading: **Summary**\n"
+        "2) Bullet points (•) 3–7 bullets.\n"
+        "3) Cite as [S1], [S2] only (no 'Page' inside bullet).\n"
+        "4) End with **Sources**\n"
+        "5) One source per line:\n"
+        "   - S1 — Page 9 — Handout-2.pdf\n"
     )
 
 
@@ -346,7 +373,6 @@ async def chat_with_pdf(req: ChatRequest):
         answer_lang = user_lang
 
     retrieval_query = translate_to_english_if_needed(req.message)
-
     retrieved = merge_retrieval(doc_ids, retrieval_query, top_k_total=7, k_per_doc=5)
 
     if (not retrieved) or (retrieved[0].get("score", 0.0) < 0.05):
@@ -375,13 +401,14 @@ async def chat_with_pdf(req: ChatRequest):
         history_text = "\n".join(lines)
 
     mode_instructions = build_mode_instructions(req.mode)
-    out_rules = build_output_rules(answer_lang)
+    out_fmt = build_output_format(answer_lang)
+    lang_rule = "Answer in Arabic only." if answer_lang == "ar" else "Answer in English only."
 
     prompt = f"""
 You are a helpful AI assistant.
 
 {mode_instructions}
-{out_rules}
+{out_fmt}
 
 Rules:
 - Use ONLY the PDF context below.
@@ -397,8 +424,10 @@ PDF Context:
 
 User Question:
 {req.message}
+
+{lang_rule}
 """
-    answer = (call_llm(prompt) or "").strip()
+    answer = call_llm(prompt)
 
     sources = []
     for item in retrieved:
@@ -419,4 +448,4 @@ User Question:
 
 @app.get("/")
 async def root():
-    return {"message": "AI Study Assistant API is running ✅"}
+    return {"message": "StudySpark AI API is running ✅"}

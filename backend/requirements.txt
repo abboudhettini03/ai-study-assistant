@@ -1,5 +1,7 @@
 fastapi
-uvicorn
-pypdf2
+uvicorn[standard]
 python-multipart
+PyPDF2
 requests
+scikit-learn
+pydantic

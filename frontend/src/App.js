@@ -30,39 +30,28 @@ function renderWithCitations(text, dir) {
     const raw = m[0];
     const id = raw.replace("[", "").replace("]", "").replace("(", "").replace(")", "");
     parts.push(
-      <span
-        key={`${m.index}-${id}`}
-        className="citeBadge codeLike"
-        dir="ltr"
-        title="Citation"
-      >
+      <span key={`${m.index}-${id}`} className="citeBadge" dir="ltr" title="Citation">
         {id}
       </span>
     );
     last = m.index + raw.length;
   }
-
   const rest = text.slice(last);
   if (rest) parts.push(rest);
 
-  // bidiSafe prevents RTL/LTR scrambling
-  return (
-    <span dir={dir} className="bidiSafe">
-      {parts}
-    </span>
-  );
+  return <span dir={dir}>{parts}</span>;
 }
 
 function App() {
   // ====== Language UI
-  const [uiLang, setUiLang] = useState("en");
+  const [uiLang, setUiLang] = useState("en"); // UI language toggle
   const uiDir = uiLang === "ar" ? "rtl" : "ltr";
   const t = (en, ar) => (uiLang === "ar" ? ar : en);
 
   // ====== PDFs
   const [file, setFile] = useState(null);
   const [pdfs, setPdfs] = useState([]); // [{doc_id, filename, num_pages, text}]
-  const [selectedDocIds, setSelectedDocIds] = useState([]);
+  const [selectedDocIds, setSelectedDocIds] = useState([]); // multi selection
 
   // ====== Study Text
   const [text, setText] = useState("");
@@ -78,24 +67,37 @@ function App() {
   // ====== Chat
   const [mode, setMode] = useState("strict");
   const [chatInput, setChatInput] = useState("");
-  const [chatMessages, setChatMessages] = useState([]); // [{role, content, sources, lang}]
+  const [chatMessages, setChatMessages] = useState([]); // [{role, content, sources, lang, pending?}]
   const [isTyping, setIsTyping] = useState(false);
 
   // ====== UX
-  const [tab, setTab] = useState("chat");
+  const [tab, setTab] = useState("chat"); // chat | summary | questions | flashcards
   const [loadingAction, setLoadingAction] = useState(null);
   const [error, setError] = useState("");
   const chatEndRef = useRef(null);
 
-  useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [chatMessages, isTyping, tab]);
+  // ====== Toasts
+  const [toasts, setToasts] = useState([]);
+  const toastIdRef = useRef(1);
+
+  // ====== PDF Preview Modal
+  const [preview, setPreview] = useState({
+    open: false,
+    doc_id: "",
+    filename: "",
+    page: 1,
+  });
 
   const selectedPdfs = useMemo(
     () => pdfs.filter((p) => selectedDocIds.includes(p.doc_id)),
     [pdfs, selectedDocIds]
   );
 
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [chatMessages, isTyping, tab]);
+
+  // Keep the big text area synced with selected PDFs
   useEffect(() => {
     if (selectedPdfs.length === 0) return;
     const combined = selectedPdfs
@@ -106,6 +108,16 @@ function App() {
   }, [selectedPdfs]);
 
   const isLoading = (k) => loadingAction === k;
+
+  // ====== Toast helpers
+  const pushToast = (type, message) => {
+    const id = toastIdRef.current++;
+    const toast = { id, type, message };
+    setToasts((prev) => [toast, ...prev].slice(0, 5));
+    window.setTimeout(() => {
+      setToasts((prev) => prev.filter((x) => x.id !== id));
+    }, 3400);
+  };
 
   const handleFileChange = (e) => {
     setFile(e.target.files?.[0] || null);
@@ -128,11 +140,13 @@ function App() {
     setFlashcards("");
     setChatMessages([]);
     setError("");
+    pushToast("info", t("PDF library cleared.", "تم مسح مكتبة الملفات."));
   };
 
   const handleUpload = async () => {
     if (!file) {
       setError(t("Please choose a PDF first.", "اختر ملف PDF أولاً."));
+      pushToast("error", t("Choose a PDF first.", "اختر PDF أولاً."));
       return;
     }
 
@@ -164,8 +178,11 @@ function App() {
       setSummary("");
       setQuestions("");
       setFlashcards("");
+
+      pushToast("success", t("Uploaded & extracted successfully.", "تم الرفع والاستخراج بنجاح."));
     } catch (e) {
       setError(e?.message || "Upload error.");
+      pushToast("error", e?.message || t("Upload error.", "خطأ في الرفع."));
     } finally {
       setLoadingAction(null);
     }
@@ -174,6 +191,7 @@ function App() {
   const handleSummarize = async () => {
     if (!text.trim()) {
       setError(t("No text available.", "لا يوجد نص متاح."));
+      pushToast("error", t("No text to summarize.", "لا يوجد نص للتلخيص."));
       return;
     }
     setLoadingAction("summary");
@@ -190,8 +208,10 @@ function App() {
       if (!res.ok) throw new Error(data?.detail || "Summary failed.");
       setSummary(data.summary || "");
       setTab("summary");
+      pushToast("success", t("Summary generated.", "تم إنشاء الملخص."));
     } catch (e) {
       setError(e?.message || "Summary error.");
+      pushToast("error", e?.message || t("Summary error.", "خطأ في التلخيص."));
     } finally {
       setLoadingAction(null);
     }
@@ -200,6 +220,7 @@ function App() {
   const handleQuestions = async () => {
     if (!text.trim()) {
       setError(t("No text available.", "لا يوجد نص متاح."));
+      pushToast("error", t("No text for questions.", "لا يوجد نص للأسئلة."));
       return;
     }
     setLoadingAction("questions");
@@ -216,8 +237,10 @@ function App() {
       if (!res.ok) throw new Error(data?.detail || "Questions failed.");
       setQuestions(data.questions || "");
       setTab("questions");
+      pushToast("success", t("Questions generated.", "تم إنشاء الأسئلة."));
     } catch (e) {
       setError(e?.message || "Questions error.");
+      pushToast("error", e?.message || t("Questions error.", "خطأ في إنشاء الأسئلة."));
     } finally {
       setLoadingAction(null);
     }
@@ -226,6 +249,7 @@ function App() {
   const handleFlashcards = async () => {
     if (!text.trim()) {
       setError(t("No text available.", "لا يوجد نص متاح."));
+      pushToast("error", t("No text for flashcards.", "لا يوجد نص للبطاقات."));
       return;
     }
     setLoadingAction("flashcards");
@@ -242,8 +266,10 @@ function App() {
       if (!res.ok) throw new Error(data?.detail || "Flashcards failed.");
       setFlashcards(data.flashcards || "");
       setTab("flashcards");
+      pushToast("success", t("Flashcards generated.", "تم إنشاء البطاقات."));
     } catch (e) {
       setError(e?.message || "Flashcards error.");
+      pushToast("error", e?.message || t("Flashcards error.", "خطأ في إنشاء البطاقات."));
     } finally {
       setLoadingAction(null);
     }
@@ -252,6 +278,7 @@ function App() {
   const handleDownload = () => {
     if (!summary && !questions && !flashcards) {
       setError(t("Nothing to download yet.", "لا يوجد شيء للتحميل بعد."));
+      pushToast("info", t("Generate something first.", "أنشئ شيئًا أولًا."));
       return;
     }
 
@@ -270,15 +297,31 @@ function App() {
     a.click();
     a.remove();
     URL.revokeObjectURL(url);
+
+    pushToast("success", t("Downloaded.", "تم التحميل."));
   };
 
   const handleClearChat = () => {
     setChatMessages([]);
     setChatInput("");
     setError("");
+    pushToast("info", t("Chat cleared.", "تم مسح الدردشة."));
   };
 
-  const buildHistoryPayload = (msgs) => msgs.slice(-8).map((m) => ({ role: m.role, content: m.content }));
+  const buildHistoryPayload = (msgs) => {
+    const tail = msgs.slice(-8).map((m) => ({ role: m.role, content: m.content }));
+    return tail;
+  };
+
+  const openPreview = (source) => {
+    // iframe supports #page=
+    setPreview({
+      open: true,
+      doc_id: source.doc_id,
+      filename: source.filename || "document.pdf",
+      page: source.page || 1,
+    });
+  };
 
   const handleChatSend = async () => {
     const msg = chatInput.trim();
@@ -286,14 +329,24 @@ function App() {
 
     if (selectedDocIds.length === 0) {
       setError(t("Select at least one PDF first.", "اختر ملف PDF واحد على الأقل أولاً."));
+      pushToast("error", t("Select PDFs first.", "اختر ملفات أولاً."));
       return;
     }
     if (loadingAction === "chat") return;
 
     const userLang = hasArabic(msg) ? "ar" : "en";
-
     const userMsg = { role: "user", content: msg, sources: [], lang: userLang };
-    setChatMessages((prev) => [...prev, userMsg]);
+
+    // add user + pending assistant skeleton bubble
+    const pendingBot = {
+      role: "assistant",
+      content: "",
+      sources: [],
+      lang: uiLang === "ar" ? "ar" : "en",
+      pending: true,
+    };
+
+    setChatMessages((prev) => [...prev, userMsg, pendingBot]);
     setChatInput("");
 
     setLoadingAction("chat");
@@ -326,58 +379,170 @@ function App() {
         content: answer,
         sources: data?.sources || [],
         lang: answerLang,
+        pending: false,
       };
 
-      setChatMessages((prev) => [...prev, botMsg]);
+      // replace last pending bubble
+      setChatMessages((prev) => {
+        const next = [...prev];
+        // find last pending
+        for (let i = next.length - 1; i >= 0; i--) {
+          if (next[i]?.pending) {
+            next[i] = botMsg;
+            return next;
+          }
+        }
+        return [...next, botMsg];
+      });
+
       setTab("chat");
+      pushToast("success", t("Answer ready.", "تمت الإجابة."));
     } catch (e) {
       setError(e?.message || t("Chat error.", "خطأ في الدردشة."));
+      pushToast("error", e?.message || t("Chat error.", "خطأ في الدردشة."));
+
+      // remove pending bubble if exists
+      setChatMessages((prev) => prev.filter((m) => !m.pending));
     } finally {
       setIsTyping(false);
       setLoadingAction(null);
     }
   };
 
-  const ui = {
-    title: t("AI Study Assistant", "مساعد الدراسة بالذكاء الاصطناعي"),
-    subtitle: t(
-      "Upload one or more PDFs, chat with sources + page numbers, and generate study materials.",
-      "ارفع ملف/ملفات PDF، اسأل مع مصادر + أرقام الصفحات، وأنشئ ملخص وأسئلة وبطاقات."
-    ),
+  const brand = {
+    name: "StudySpark AI",
+    name_ar: "StudySpark AI",
+    tag: t("From PDF to mastery — beautifully.", "من PDF إلى الإتقان — بشكل جميل."),
   };
+
+  const showLanding = pdfs.length === 0;
 
   return (
     <div className="appRoot" dir={uiDir}>
       <div className="bgGlow" />
 
+      {/* Toasts */}
+      <div className="toastStack" aria-live="polite" aria-atomic="true">
+        {toasts.map((x) => (
+          <div key={x.id} className={`toast ${x.type}`}>
+            <div className="toastDot" />
+            <div className="toastMsg">{x.message}</div>
+            <button
+              className="toastX"
+              onClick={() => setToasts((p) => p.filter((t) => t.id !== x.id))}
+              aria-label="Close"
+            >
+              ✕
+            </button>
+          </div>
+        ))}
+      </div>
+
+      {/* PDF Preview Modal */}
+      {preview.open && (
+        <div className="modalOverlay" onMouseDown={() => setPreview((p) => ({ ...p, open: false }))}>
+          <div className="modalCard" onMouseDown={(e) => e.stopPropagation()}>
+            <div className="modalTop">
+              <div className="modalTitle">
+                {t("PDF Preview", "معاينة PDF")}{" "}
+                <span className="modalSubtle" dir="ltr">
+                  — {preview.filename} — {t("Page", "صفحة")} {preview.page}
+                </span>
+              </div>
+              <div className="modalActions">
+                <a
+                  className="tinyBtn"
+                  href={`${API_BASE}/pdf/${preview.doc_id}#page=${preview.page}`}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  {t("Open in new tab", "فتح في تبويب")}
+                </a>
+                <button className="tinyBtn" onClick={() => setPreview((p) => ({ ...p, open: false }))}>
+                  {t("Close", "إغلاق")}
+                </button>
+              </div>
+            </div>
+
+            <div className="modalBody">
+              <iframe
+                title="pdf-preview"
+                className="pdfFrame"
+                src={`${API_BASE}/pdf/${preview.doc_id}#page=${preview.page}`}
+              />
+            </div>
+          </div>
+        </div>
+      )}
+
       <header className="topBar">
         <div className="brand">
           <div className="logoDot" />
           <div>
-            <div className="brandTitle">{ui.title}</div>
-            <div className="brandSub">{ui.subtitle}</div>
+            <div className="brandTitle">{uiLang === "ar" ? brand.name_ar : brand.name}</div>
+            <div className="brandSub">{brand.tag}</div>
           </div>
         </div>
 
         <div className="topActions">
           <div className="pillToggle">
-            <button className={`pill ${uiLang === "en" ? "active" : ""}`} onClick={() => setUiLang("en")}>
+            <button
+              className={`pill ${uiLang === "en" ? "active" : ""}`}
+              onClick={() => setUiLang("en")}
+            >
               EN
             </button>
-            <button className={`pill ${uiLang === "ar" ? "active" : ""}`} onClick={() => setUiLang("ar")}>
+            <button
+              className={`pill ${uiLang === "ar" ? "active" : ""}`}
+              onClick={() => setUiLang("ar")}
+            >
               AR
             </button>
           </div>
+
           <div className="tinyMeta">
             <div className="metaLine">
               {t("Backend:", "الخلفية:")} <span>{t("FastAPI + Groq", "FastAPI + Groq")}</span>
             </div>
             <div className="metaLine">
-              {t("Chat:", "الدردشة:")} <span>{t("Multi-PDF + Sources", "Multi-PDF + مصادر")}</span>
+              {t("Features:", "المميزات:")} <span>{t("Sources + Preview", "مصادر + معاينة")}</span>
             </div>
           </div>
         </div>
       </header>
+
+      {showLanding && (
+        <section className="landing">
+          <div className="landingHero">
+            <div className="heroKicker">{t("Premium Study Experience", "تجربة مذاكرة فخمة")}</div>
+            <div className="heroTitle">
+              {t("Turn PDFs into clean answers, summaries, and exam material.", "حوّل ملفات PDF إلى إجابات مرتبة وملخص وأسئلة امتحانية.")}
+            </div>
+            <div className="heroSub">
+              {t(
+                "Upload multiple PDFs, ask in Arabic or English, and cite sources with page numbers — instantly.",
+                "ارفع عدة ملفات، اسأل بالعربي أو الإنجليزي، واحصل على استشهادات مع أرقام الصفحات فورًا."
+              )}
+            </div>
+
+            <div className="heroCTA">
+              <button className="btn primary bigBtn" onClick={() => pushToast("info", t("Start by uploading a PDF from the left panel.", "ابدأ برفع PDF من اللوحة اليسرى."))}>
+                {t("Get Started", "ابدأ الآن")}
+              </button>
+              <div className="heroMiniNote">
+                {t("No accounts yet — just pure productivity.", "بدون حسابات حالياً — إنتاجية مباشرة.")}
+              </div>
+            </div>
+          </div>
+
+          <div className="featureGrid">
+            <FeatureCard title={t("Chat with sources", "دردشة مع مصادر")} sub={t("Citations like [S1] + page numbers.", "استشهادات [S1] + أرقام صفحات.")} icon="📌" />
+            <FeatureCard title={t("Multi-PDF", "عدة ملفات")} sub={t("Select multiple PDFs and compare concepts.", "حدد عدة ملفات وقارن المفاهيم.")} icon="📚" />
+            <FeatureCard title={t("Preview instantly", "معاينة فورية")} sub={t("Open the PDF at the cited page.", "افتح الـ PDF على صفحة المصدر.")} icon="🔍" />
+            <FeatureCard title={t("Study modes", "أوضاع مذاكرة")} sub={t("Strict / Simple / Exam-ready.", "صارم / مبسط / امتحاني.")} icon="⚡" />
+          </div>
+        </section>
+      )}
 
       <main className="layout">
         {/* Sidebar */}
@@ -404,37 +569,46 @@ function App() {
             </div>
 
             <div className="pdfListWrap">
-              {pdfs.length === 0 ? (
+              {isLoading("upload") && (
+                <div className="pdfList">
+                  <SkeletonPdfItem />
+                  <SkeletonPdfItem />
+                </div>
+              )}
+
+              {!isLoading("upload") && pdfs.length === 0 ? (
                 <div className="empty">
                   <div className="emptyTitle">{t("No PDFs yet", "لا يوجد ملفات بعد")}</div>
                   <div className="emptySub">{t("Upload a PDF to start chatting.", "ارفع ملفًا لتبدأ الدردشة.")}</div>
                 </div>
               ) : (
-                <div className="pdfList">
-                  {pdfs.map((p) => {
-                    const checked = selectedDocIds.includes(p.doc_id);
-                    return (
-                      <button
-                        key={p.doc_id}
-                        className={`pdfItem ${checked ? "checked" : ""}`}
-                        onClick={() => toggleSelect(p.doc_id)}
-                        title={p.filename}
-                      >
-                        <div className="checkBox">
-                          <div className={`checkDot ${checked ? "on" : ""}`} />
-                        </div>
-                        <div className="pdfMeta">
-                          <div className="pdfName">{p.filename}</div>
-                          <div className="pdfSub">
-                            {t("Pages:", "الصفحات:")} <span>{p.num_pages ?? "—"}</span>{" "}
-                            <span className="sep">•</span> <span className="mono">{p.doc_id.slice(0, 8)}</span>
+                !isLoading("upload") && (
+                  <div className="pdfList">
+                    {pdfs.map((p) => {
+                      const checked = selectedDocIds.includes(p.doc_id);
+                      return (
+                        <button
+                          key={p.doc_id}
+                          className={`pdfItem ${checked ? "checked" : ""}`}
+                          onClick={() => toggleSelect(p.doc_id)}
+                          title={p.filename}
+                        >
+                          <div className="checkBox">
+                            <div className={`checkDot ${checked ? "on" : ""}`} />
                           </div>
-                        </div>
-                        <div className="chip">{checked ? t("Selected", "محدد") : t("Tap", "اضغط")}</div>
-                      </button>
-                    );
-                  })}
-                </div>
+                          <div className="pdfMeta">
+                            <div className="pdfName">{p.filename}</div>
+                            <div className="pdfSub">
+                              {t("Pages:", "الصفحات:")} <span>{p.num_pages ?? "—"}</span>{" "}
+                              <span className="sep">•</span> <span className="mono">{p.doc_id.slice(0, 8)}</span>
+                            </div>
+                          </div>
+                          <div className="chip">{checked ? t("Selected", "محدد") : t("Tap", "اضغط")}</div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                )
               )}
             </div>
 
@@ -536,6 +710,7 @@ function App() {
 
             {error && <div className="alert">{error}</div>}
 
+            {/* CHAT TAB */}
             {tab === "chat" && (
               <div className="chatWrap">
                 <div className="chatHeader">
@@ -543,8 +718,8 @@ function App() {
                     <div className="hTitle">{t("Chat with selected PDFs", "الدردشة مع الملفات المحددة")}</div>
                     <div className="hSub">
                       {t(
-                        "Ask in Arabic or English — citations stay clean as [S1].",
-                        "اسأل بالعربي أو الإنجليزي — الاستشهادات تبقى مرتبة مثل [S1]."
+                        "Tip: Ask in Arabic or English — citations stay clean.",
+                        "نصيحة: اسأل بالعربي أو الإنجليزي — والاستشهادات ستبقى مرتبة."
                       )}
                     </div>
                   </div>
@@ -558,10 +733,7 @@ function App() {
                     <div className="chatEmpty">
                       <div className="chatEmptyTitle">{t("Start with a question…", "ابدأ بسؤال…")}</div>
                       <div className="chatEmptySub">
-                        {t(
-                          "Example: What is class imbalance? / ما هو عدم توازن الفئات؟",
-                          "مثال: What is class imbalance? / ما هو عدم توازن الفئات؟"
-                        )}
+                        {t("Example: What is class imbalance?", "مثال: ما هو عدم توازن الفئات؟")}
                       </div>
                     </div>
                   ) : (
@@ -575,18 +747,11 @@ function App() {
                           content={m.content}
                           sources={m.sources || []}
                           uiLang={uiLang}
+                          pending={!!m.pending}
+                          onOpenPreview={openPreview}
                         />
                       );
                     })
-                  )}
-
-                  {isTyping && (
-                    <div className="typingRow">
-                      <div className="typingDot" />
-                      <div className="typingDot" />
-                      <div className="typingDot" />
-                      <span className="typingText">{t("Assistant is thinking…", "المساعد يفكر…")}</span>
-                    </div>
                   )}
 
                   <div ref={chatEndRef} />
@@ -619,6 +784,7 @@ function App() {
               </div>
             )}
 
+            {/* STUDY TABS */}
             {tab !== "chat" && (
               <div className="studyWrap">
                 <div className="split">
@@ -628,10 +794,7 @@ function App() {
                       className="bigText"
                       value={text}
                       onChange={(e) => setText(e.target.value)}
-                      placeholder={t(
-                        "Paste notes here or upload PDFs from the sidebar…",
-                        "الصق ملاحظاتك هنا أو ارفع ملفات من الشريط الجانبي…"
-                      )}
+                      placeholder={t("Paste notes here…", "الصق ملاحظاتك هنا…")}
                     />
                   </div>
 
@@ -643,14 +806,27 @@ function App() {
                         ? t("Questions", "الأسئلة")
                         : t("Flashcards", "البطاقات")}
                     </div>
+
                     <div className="outputBox" dir={uiLang === "ar" ? "rtl" : "ltr"}>
-                      <pre className="bidiSafe">
-                        {tab === "summary"
-                          ? summary || t("No summary yet.", "لا يوجد ملخص بعد.")
-                          : tab === "questions"
-                          ? questions || t("No questions yet.", "لا توجد أسئلة بعد.")
-                          : flashcards || t("No flashcards yet.", "لا توجد بطاقات بعد.")}
-                      </pre>
+                      {(isLoading("summary") && tab === "summary") ||
+                      (isLoading("questions") && tab === "questions") ||
+                      (isLoading("flashcards") && tab === "flashcards") ? (
+                        <div>
+                          <SkeletonLine />
+                          <SkeletonLine />
+                          <SkeletonLine w="78%" />
+                          <SkeletonLine w="62%" />
+                          <SkeletonLine w="88%" />
+                        </div>
+                      ) : (
+                        <pre>
+                          {tab === "summary"
+                            ? summary || t("No summary yet.", "لا يوجد ملخص بعد.")
+                            : tab === "questions"
+                            ? questions || t("No questions yet.", "لا توجد أسئلة بعد.")
+                            : flashcards || t("No flashcards yet.", "لا توجد بطاقات بعد.")}
+                        </pre>
+                      )}
                     </div>
 
                     <div className="miniRow">
@@ -681,15 +857,40 @@ function App() {
   );
 }
 
-function ChatBubble({ role, content, sources, dir, uiLang }) {
+function FeatureCard({ title, sub, icon }) {
+  return (
+    <div className="featureCard">
+      <div className="featureIcon">{icon}</div>
+      <div className="featureTitle">{title}</div>
+      <div className="featureSub">{sub}</div>
+    </div>
+  );
+}
+
+function SkeletonPdfItem() {
+  return (
+    <div className="pdfItem skeletonItem" aria-hidden="true">
+      <div className="skBox" />
+      <div className="skMeta">
+        <div className="skLine" />
+        <div className="skLine short" />
+      </div>
+      <div className="skChip" />
+    </div>
+  );
+}
+
+function SkeletonLine({ w }) {
+  return <div className="skLineOut" style={{ width: w || "100%" }} />;
+}
+
+function ChatBubble({ role, content, sources, dir, uiLang, pending, onOpenPreview }) {
   const [open, setOpen] = useState(false);
   const isUser = role === "user";
   const title = isUser ? (uiLang === "ar" ? "أنت" : "You") : uiLang === "ar" ? "المساعد" : "Assistant";
 
-  const lines = (content || "")
-    .split("\n")
-    .map((x) => x.trimEnd())
-    .filter((x) => x.trim().length > 0);
+  const lines = (content || "").split("\n").filter((x) => x.trim().length > 0);
+  const messageLangDir = dir;
 
   const hasSources = Array.isArray(sources) && sources.length > 0;
 
@@ -703,10 +904,11 @@ function ChatBubble({ role, content, sources, dir, uiLang }) {
 
   return (
     <div className={`bubbleRow ${isUser ? "user" : "assistant"}`}>
-      <div className={`bubble ${isUser ? "user" : "assistant"}`} dir={dir}>
+      <div className={`bubble ${isUser ? "user" : "assistant"}`} dir={messageLangDir}>
         <div className="bubbleTop">
           <span className="bubbleTitle">{title}</span>
-          {!isUser && hasSources && (
+
+          {!isUser && hasSources && !pending && (
             <button className="miniLink" onClick={() => setOpen((v) => !v)}>
               {open
                 ? uiLang === "ar"
@@ -719,30 +921,35 @@ function ChatBubble({ role, content, sources, dir, uiLang }) {
           )}
         </div>
 
-        <div className="bubbleContent bidiSafe">
-          {lines.map((line, idx) => {
-            const isBullet = line.trim().startsWith("•") || line.trim().startsWith("- ");
-            const isHeading =
-              (!isBullet && idx === 0 && line.length <= 60) ||
-              line.startsWith("**") ||
-              line.endsWith(":");
-
-            return (
-              <div key={idx} className={isBullet ? "line bullet" : isHeading ? "line heading" : "line"}>
-                {renderWithCitations(line, dir)}
-              </div>
-            );
-          })}
+        <div className="bubbleContent">
+          {pending ? (
+            <div className="bubbleSkeleton">
+              <div className="skLineOut" />
+              <div className="skLineOut" style={{ width: "88%" }} />
+              <div className="skLineOut" style={{ width: "70%" }} />
+            </div>
+          ) : (
+            lines.map((line, idx) => {
+              const isBullet = line.trim().startsWith("•") || line.trim().startsWith("- ");
+              // headings style
+              const isHeading = line.includes("الخلاصة") || line.includes("Summary") || line.includes("المصادر") || line.includes("Sources");
+              return (
+                <div key={idx} className={`line ${isBullet ? "bullet" : ""} ${isHeading ? "heading" : ""}`}>
+                  {renderWithCitations(line, messageLangDir)}
+                </div>
+              );
+            })
+          )}
         </div>
 
-        {!isUser && hasSources && open && (
+        {!isUser && hasSources && open && !pending && (
           <div className="sourcesGrid" dir={uiLang === "ar" ? "rtl" : "ltr"}>
             {sources.map((s) => {
               const citation = `${s.id} — Page ${s.page} — ${s.filename}`;
               return (
-                <div key={s.id} className="sourceCard">
+                <div key={`${s.id}-${s.doc_id}-${s.page}`} className="sourceCard">
                   <div className="sourceTop">
-                    <span className="badge codeLike" dir="ltr">
+                    <span className="badge" dir="ltr">
                       {s.id}
                     </span>
                     <span className="badge subtle">{uiLang === "ar" ? `صفحة ${s.page}` : `Page ${s.page}`}</span>
@@ -750,13 +957,16 @@ function ChatBubble({ role, content, sources, dir, uiLang }) {
                       {s.filename}
                     </span>
                   </div>
-                  <div className="sourceExcerpt bidiSafe">{s.excerpt}</div>
+                  <div className="sourceExcerpt">{s.excerpt}</div>
                   <div className="sourceActions">
                     <button className="tinyBtn" onClick={() => copyText(s.excerpt)}>
                       {uiLang === "ar" ? "نسخ المقتطف" : "Copy excerpt"}
                     </button>
                     <button className="tinyBtn" onClick={() => copyText(citation)}>
                       {uiLang === "ar" ? "نسخ الاستشهاد" : "Copy citation"}
+                    </button>
+                    <button className="tinyBtn" onClick={() => onOpenPreview(s)}>
+                      {uiLang === "ar" ? "فتح الصفحة" : "Open page"}
                     </button>
                   </div>
                 </div>
@@ -765,7 +975,7 @@ function ChatBubble({ role, content, sources, dir, uiLang }) {
           </div>
         )}
 
-        {!isUser && (
+        {!isUser && !pending && (
           <div className="bubbleFooter">
             <button className="tinyBtn" onClick={() => copyText(content || "")}>
               {uiLang === "ar" ? "نسخ الإجابة" : "Copy answer"}
