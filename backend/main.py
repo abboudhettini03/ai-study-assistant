@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File  # pyright: ignore[reportMissingImports]
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends  # pyright: ignore[reportMissingImports]
 from fastapi.middleware.cors import CORSMiddleware  # type: ignore
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field  # type: ignore
@@ -8,16 +8,68 @@ import os
 import requests  # type: ignore
 import uuid
 from typing import Dict, List, Any, Optional
-from fastapi import HTTPException
+from datetime import datetime
 
 from sklearn.feature_extraction.text import TfidfVectorizer  # type: ignore
 from sklearn.metrics.pairwise import cosine_similarity  # type: ignore
+
+# ====== SQLAlchemy (Postgres) ======
+from sqlalchemy import create_engine, Column, String, Integer, Text, LargeBinary, DateTime, ForeignKey
+from sqlalchemy.orm import sessionmaker, declarative_base, Session
+
+Base = declarative_base()
+
+
+def _normalize_db_url(url: str) -> str:
+    # Render sometimes provides postgres:// ; SQLAlchemy expects postgresql://
+    url = (url or "").strip()
+    if url.startswith("postgres://"):
+        return url.replace("postgres://", "postgresql://", 1)
+    return url
+
+
+DATABASE_URL = _normalize_db_url(os.environ.get("DATABASE_URL", ""))
+
+ENGINE = create_engine(DATABASE_URL, pool_pre_ping=True) if DATABASE_URL else None
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=ENGINE) if ENGINE else None
+
+
+class Document(Base):
+    __tablename__ = "documents"
+    doc_id = Column(String, primary_key=True, index=True)  # uuid as string
+    filename = Column(String, nullable=False)
+    num_pages = Column(Integer, nullable=False)
+    full_text = Column(Text, nullable=False)
+    pdf_bytes = Column(LargeBinary, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+
+class Chunk(Base):
+    __tablename__ = "chunks"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    doc_id = Column(String, ForeignKey("documents.doc_id", ondelete="CASCADE"), index=True, nullable=False)
+    page = Column(Integer, nullable=False)
+    text = Column(Text, nullable=False)
+
+
+def get_db():
+    """
+    DB dependency. If DATABASE_URL not set, endpoints that depend on DB will fail.
+    Upload/chat still work in-memory (non-persistent) if DB is missing.
+    """
+    if not SessionLocal:
+        raise HTTPException(status_code=500, detail="DATABASE_URL not configured.")
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
 
 
 app = FastAPI(
     title="StudySpark AI API",
     description="Backend for summarizing PDFs, generating questions, flashcards, and chatting with PDFs.",
-    version="3.0.0",
+    version="3.1.0",
 )
 
 # ====== CORS ======
@@ -29,7 +81,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ====== Stores ======
+# ====== Stores (in-memory cache) ======
 DOC_STORE: Dict[str, str] = {}                     # doc_id -> full text
 PAGE_STORE: Dict[str, List[str]] = {}              # doc_id -> pages text
 CHUNK_STORE: Dict[str, List[Dict[str, Any]]] = {}  # doc_id -> [{"text":..., "page":...}]
@@ -199,14 +251,126 @@ class ChatRequest(BaseModel):
 
     message: str
     mode: str = "strict"  # "strict" | "simple" | "exam" | "chatty"
-
     lang: str = "auto"    # "auto" | "ar" | "en"
     history: List[Dict[str, str]] = Field(default_factory=list)
 
 
+# ====== Mode + Output formatting ======
+def build_mode_instructions(mode: str) -> str:
+    mode = (mode or "strict").strip().lower()
+
+    if mode == "chatty":
+        return (
+            "MODE: CHATTY.\n"
+            "- Be conversational and natural, like ChatGPT.\n"
+            "- Ask ONE short clarifying question if needed.\n"
+            "- Prefer short paragraphs, not rigid bullet templates.\n"
+            "- Use the PDF context as primary; do not invent citations.\n"
+            "- If a detail is not supported by the PDF context, say it is general knowledge.\n"
+        )
+
+    if mode == "simple":
+        return (
+            "MODE: SIMPLE.\n"
+            "- Explain in very simple terms.\n"
+            "- Use short sentences.\n"
+            "- Give a tiny example if possible.\n"
+            "- Use ONLY the PDF context.\n"
+        )
+    if mode == "exam":
+        return (
+            "MODE: EXAM.\n"
+            "- Answer like a model exam answer.\n"
+            "- Use structured points (definition → key ideas → steps → notes).\n"
+            "- Use ONLY the PDF context.\n"
+        )
+    return (
+        "MODE: STRICT.\n"
+        "- Answer ONLY from the provided PDF context.\n"
+        "- If missing, say you couldn't find it in the PDF.\n"
+    )
+
+
+def build_output_format(answer_lang: str) -> str:
+    """
+    Force stable Arabic formatting to avoid RTL/LTR mess.
+    Keep citations like [S1] in body; page/file in Sources section.
+    """
+    if answer_lang == "ar":
+        return (
+            "OUTPUT FORMAT (Arabic):\n"
+            "1) عنوان قصير: **الخلاصة**\n"
+            "2) نقاط مرتبة (•) من 3 إلى 7 نقاط.\n"
+            "3) داخل النقاط: استخدم [S1] أو [S2] فقط (بدون كلمة Page داخل الجملة).\n"
+            "4) في النهاية: **المصادر**\n"
+            "5) كل سطر:\n"
+            "   - S1 — صفحة 9 — Handout-2.pdf\n"
+            "مهم: لا تضع رقم الصفحة داخل الجملة العربية.\n"
+        )
+    return (
+        "OUTPUT FORMAT (English):\n"
+        "1) Heading: **Summary**\n"
+        "2) Bullet points (•) 3–7 bullets.\n"
+        "3) Cite as [S1], [S2] only (no 'Page' inside bullet).\n"
+        "4) End with **Sources**\n"
+        "5) One source per line:\n"
+        "   - S1 — Page 9 — Handout-2.pdf\n"
+    )
+
+
+# ====== Persistence loader ======
+def load_all_docs_from_db(db: Session) -> None:
+    # clear in-memory
+    DOC_STORE.clear()
+    PAGE_STORE.clear()
+    CHUNK_STORE.clear()
+    VEC_STORE.clear()
+    DOC_META.clear()
+    PDF_STORE.clear()
+
+    docs = db.query(Document).order_by(Document.created_at.desc()).all()
+    for d in docs:
+        doc_id = d.doc_id
+        DOC_STORE[doc_id] = d.full_text
+        DOC_META[doc_id] = {"filename": d.filename, "num_pages": d.num_pages}
+        PDF_STORE[doc_id] = bytes(d.pdf_bytes)
+
+        chunk_rows = (
+            db.query(Chunk)
+            .filter(Chunk.doc_id == doc_id)
+            .order_by(Chunk.id.asc())
+            .all()
+        )
+        chunks = [{"text": c.text, "page": int(c.page)} for c in chunk_rows]
+        CHUNK_STORE[doc_id] = chunks
+
+        if chunks:
+            build_tfidf_index(doc_id, chunks)
+
+
+@app.on_event("startup")
+def on_startup():
+    if not ENGINE:
+        # No DB configured; app still runs in-memory (non-persistent)
+        print("INFO: DATABASE_URL not set; running in-memory (non-persistent).")
+        return
+
+    Base.metadata.create_all(bind=ENGINE)
+
+    db = SessionLocal()
+    try:
+        load_all_docs_from_db(db)
+        print(f"INFO: Loaded {len(DOC_META)} documents from DB.")
+    finally:
+        db.close()
+
+
 # ====== Upload ======
 @app.post("/upload")
-async def upload_pdf(file: UploadFile = File(...)):
+async def upload_pdf(file: UploadFile = File(...), db: Optional[Session] = Depends(get_db)):
+    """
+    Persistent upload (requires DATABASE_URL).
+    """
     content = await file.read()
     pages = extract_pages_from_pdf(content)
     full_text = "\n\n".join([p for p in pages if p.strip()])
@@ -222,12 +386,30 @@ async def upload_pdf(file: UploadFile = File(...)):
     filename = file.filename or "document.pdf"
     num_pages = len(pages)
 
-    PDF_STORE[doc_id] = content  # <-- for preview
+    chunks = chunk_pages(pages, chunk_size=1200, overlap=200)
+
+    # --- persist to DB ---
+    # (db dependency will raise if DATABASE_URL missing)
+    doc_row = Document(
+        doc_id=doc_id,
+        filename=filename,
+        num_pages=num_pages,
+        full_text=full_text,
+        pdf_bytes=content,
+    )
+    db.add(doc_row)
+    db.flush()
+
+    for c in chunks:
+        db.add(Chunk(doc_id=doc_id, page=int(c.get("page", 0) or 0), text=c.get("text", "")))
+
+    db.commit()
+
+    # --- update in-memory cache ---
+    PDF_STORE[doc_id] = content
     DOC_STORE[doc_id] = full_text
     PAGE_STORE[doc_id] = pages
     DOC_META[doc_id] = {"filename": filename, "num_pages": num_pages}
-
-    chunks = chunk_pages(pages, chunk_size=1200, overlap=200)
     CHUNK_STORE[doc_id] = chunks
     build_tfidf_index(doc_id, chunks)
 
@@ -235,15 +417,20 @@ async def upload_pdf(file: UploadFile = File(...)):
 
 
 # ====== PDF Preview endpoint ======
-
-
 @app.get("/pdf/{doc_id}")
-async def get_pdf(doc_id: str):
+async def get_pdf(doc_id: str, db: Session = Depends(get_db)):
     pdf = PDF_STORE.get(doc_id)
-    if not pdf:
-        raise HTTPException(status_code=404, detail="PDF not found. Re-upload the PDF.")
-
     meta = DOC_META.get(doc_id, {})
+
+    if not pdf:
+        d = db.query(Document).filter(Document.doc_id == doc_id).first()
+        if not d:
+            raise HTTPException(status_code=404, detail="PDF not found. Re-upload the PDF.")
+        pdf = bytes(d.pdf_bytes)
+        meta = {"filename": d.filename, "num_pages": d.num_pages}
+        PDF_STORE[doc_id] = pdf
+        DOC_META[doc_id] = {"filename": d.filename, "num_pages": d.num_pages}
+
     filename = meta.get("filename", "document.pdf")
 
     return StreamingResponse(
@@ -255,6 +442,54 @@ async def get_pdf(doc_id: str):
         },
     )
 
+
+# ====== Docs API (Library) ======
+@app.get("/docs")
+async def list_docs(db: Session = Depends(get_db)):
+    docs = db.query(Document).order_by(Document.created_at.desc()).all()
+    return [
+        {
+            "doc_id": d.doc_id,
+            "filename": d.filename,
+            "num_pages": d.num_pages,
+            "created_at": d.created_at.isoformat() if d.created_at else None,
+        }
+        for d in docs
+    ]
+
+
+@app.get("/docs/{doc_id}")
+async def get_doc(doc_id: str, db: Session = Depends(get_db)):
+    d = db.query(Document).filter(Document.doc_id == doc_id).first()
+    if not d:
+        raise HTTPException(status_code=404, detail="Document not found.")
+    return {
+        "doc_id": d.doc_id,
+        "filename": d.filename,
+        "num_pages": d.num_pages,
+        "text": d.full_text,
+    }
+
+
+@app.delete("/docs/{doc_id}")
+async def delete_doc(doc_id: str, db: Session = Depends(get_db)):
+    d = db.query(Document).filter(Document.doc_id == doc_id).first()
+    if not d:
+        raise HTTPException(status_code=404, detail="Document not found.")
+
+    db.query(Chunk).filter(Chunk.doc_id == doc_id).delete()
+    db.query(Document).filter(Document.doc_id == doc_id).delete()
+    db.commit()
+
+    # remove from memory if present
+    PDF_STORE.pop(doc_id, None)
+    DOC_STORE.pop(doc_id, None)
+    PAGE_STORE.pop(doc_id, None)
+    CHUNK_STORE.pop(doc_id, None)
+    VEC_STORE.pop(doc_id, None)
+    DOC_META.pop(doc_id, None)
+
+    return {"ok": True, "doc_id": doc_id}
 
 
 # ====== Summarize / Questions / Flashcards ======
@@ -306,70 +541,6 @@ Text:
     return {"flashcards": flashcards}
 
 
-def build_mode_instructions(mode: str) -> str:
-    mode = (mode or "strict").strip().lower()
-
-    if mode == "chatty":
-        return (
-            "MODE: CHATTY.\n"
-            "- Be conversational and natural, like ChatGPT.\n"
-            "- Ask ONE short clarifying question if needed.\n"
-            "- Prefer short paragraphs, not rigid bullet templates.\n"
-            "- Use the PDF context as primary; do not invent citations.\n"
-            "- If a detail is not supported by the PDF context, say it is general knowledge.\n"
-        )
-
-    if mode == "simple":
-        return (
-            "MODE: SIMPLE.\n"
-            "- Explain in very simple terms.\n"
-            "- Use short sentences.\n"
-            "- Give a tiny example if possible.\n"
-            "- Use ONLY the PDF context.\n"
-        )
-    if mode == "exam":
-        return (
-            "MODE: EXAM.\n"
-            "- Answer like a model exam answer.\n"
-            "- Use structured points (definition → key ideas → steps → notes).\n"
-            "- Use ONLY the PDF context.\n"
-        )
-    return (
-        "MODE: STRICT.\n"
-        "- Answer ONLY from the provided PDF context.\n"
-        "- If missing, say you couldn't find it in the PDF.\n"
-    )
-
-
-
-
-def build_output_format(answer_lang: str) -> str:
-    """
-    Force stable Arabic formatting to avoid RTL/LTR mess.
-    Keep citations like [S1] in body; page/file in Sources section.
-    """
-    if answer_lang == "ar":
-        return (
-            "OUTPUT FORMAT (Arabic):\n"
-            "1) عنوان قصير: **الخلاصة**\n"
-            "2) نقاط مرتبة (•) من 3 إلى 7 نقاط.\n"
-            "3) داخل النقاط: استخدم [S1] أو [S2] فقط (بدون كلمة Page داخل الجملة).\n"
-            "4) في النهاية: **المصادر**\n"
-            "5) كل سطر:\n"
-            "   - S1 — صفحة 9 — Handout-2.pdf\n"
-            "مهم: لا تضع رقم الصفحة داخل الجملة العربية.\n"
-        )
-    return (
-        "OUTPUT FORMAT (English):\n"
-        "1) Heading: **Summary**\n"
-        "2) Bullet points (•) 3–7 bullets.\n"
-        "3) Cite as [S1], [S2] only (no 'Page' inside bullet).\n"
-        "4) End with **Sources**\n"
-        "5) One source per line:\n"
-        "   - S1 — Page 9 — Handout-2.pdf\n"
-    )
-
-
 # ====== Chat ======
 @app.post("/chat")
 async def chat_with_pdf(req: ChatRequest):
@@ -405,7 +576,7 @@ async def chat_with_pdf(req: ChatRequest):
 
     history_text = ""
     if req.history:
-        last = req.history[-6:]
+        last = req.history[-16:]
         lines = []
         for h in last:
             role = (h.get("role") or "").strip()
@@ -427,7 +598,6 @@ async def chat_with_pdf(req: ChatRequest):
     )
 
     lang_rule = "Answer in Arabic only." if answer_lang == "ar" else "Answer in English only."
-
 
     prompt = f"""
 You are a helpful AI assistant.

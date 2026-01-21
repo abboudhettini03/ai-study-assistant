@@ -93,22 +93,6 @@ function App() {
     [pdfs, selectedDocIds]
   );
 
-  useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [chatMessages, isTyping, tab]);
-
-  // Keep the big text area synced with selected PDFs
-  useEffect(() => {
-    if (selectedPdfs.length === 0) return;
-    const combined = selectedPdfs
-      .map((p) => p.text || "")
-      .filter(Boolean)
-      .join("\n\n---\n\n");
-    setText(combined);
-  }, [selectedPdfs]);
-
-  const isLoading = (k) => loadingAction === k;
-
   // ====== Toast helpers
   const pushToast = (type, message) => {
     const id = toastIdRef.current++;
@@ -119,20 +103,100 @@ function App() {
     }, 3400);
   };
 
+  // ====== Load docs from server
+  const refreshDocs = async () => {
+    const res = await fetch(`${API_BASE}/docs`);
+    const data = await res.json();
+    if (!res.ok) throw new Error(data?.detail || "Failed to load docs.");
+    const items = (data || []).map((d) => ({
+      doc_id: d.doc_id,
+      filename: d.filename,
+      num_pages: d.num_pages,
+      text: "", // lazy-load when selected
+    }));
+    setPdfs(items);
+  };
+
+  // initial load
+  useEffect(() => {
+    const load = async () => {
+      try {
+        await refreshDocs();
+      } catch (e) {
+        // keep silent-ish to avoid annoying; you can enable toast if you want
+        // pushToast("error", e?.message || "Failed to load library.");
+      }
+    };
+    load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [chatMessages, isTyping, tab]);
+
+  // Keep the big text area synced with selected PDFs
+  useEffect(() => {
+    if (selectedPdfs.length === 0) {
+      // if none selected, do not force-clear user typed text; keep current behavior? (you can uncomment next line)
+      // setText("");
+      return;
+    }
+    const combined = selectedPdfs
+      .map((p) => p.text || "")
+      .filter(Boolean)
+      .join("\n\n---\n\n");
+    setText(combined);
+  }, [selectedPdfs]);
+
+  const isLoading = (k) => loadingAction === k;
+
   const handleFileChange = (e) => {
     setFile(e.target.files?.[0] || null);
     setError("");
   };
 
-  const toggleSelect = (doc_id) => {
+  // Select/deselect + lazy-load document text
+  const toggleSelect = async (doc_id) => {
+    setError("");
+
+    const alreadySelected = selectedDocIds.includes(doc_id);
+    const doc = pdfs.find((p) => p.doc_id === doc_id);
+
+    // If selecting and text missing, lazy-load it
+    if (!alreadySelected && doc && !doc.text) {
+      try {
+        const res = await fetch(`${API_BASE}/docs/${doc_id}`);
+        const data = await res.json();
+        if (!res.ok) throw new Error(data?.detail || "Failed to load doc text.");
+
+        setPdfs((prev) =>
+          prev.map((p) =>
+            p.doc_id === doc_id
+              ? {
+                  ...p,
+                  text: data.text || "",
+                  filename: data.filename || p.filename,
+                  num_pages: data.num_pages || p.num_pages,
+                }
+              : p
+          )
+        );
+      } catch (e) {
+        setError(e?.message || t("Failed to load document.", "فشل تحميل الملف."));
+        pushToast("error", e?.message || t("Failed to load document.", "فشل تحميل الملف."));
+        return;
+      }
+    }
+
     setSelectedDocIds((prev) => {
       if (prev.includes(doc_id)) return prev.filter((x) => x !== doc_id);
       return [...prev, doc_id];
     });
   };
 
-  const handleClearPdfs = () => {
-    setPdfs([]);
+  const handleClearPdfs = async () => {
+    // This clears local UI state only (does NOT delete server docs)
     setSelectedDocIds([]);
     setText("");
     setSummary("");
@@ -140,7 +204,13 @@ function App() {
     setFlashcards("");
     setChatMessages([]);
     setError("");
-    pushToast("info", t("PDF library cleared.", "تم مسح مكتبة الملفات."));
+    pushToast("info", t("Selection cleared.", "تم مسح التحديد."));
+    // If you want to reload from server too:
+    try {
+      await refreshDocs();
+    } catch {
+      // ignore
+    }
   };
 
   const handleUpload = async () => {
@@ -163,17 +233,13 @@ function App() {
       if (!res.ok) throw new Error(data?.detail || "Upload failed.");
       if (!data?.doc_id) throw new Error(data?.message || "No doc_id returned.");
 
-      const item = {
-        doc_id: data.doc_id,
-        filename: data.filename || file.name || "document.pdf",
-        num_pages: data.num_pages || null,
-        text: data.text || "",
-      };
+      // refresh library from server (source of truth)
+      await refreshDocs();
 
-      setPdfs((prev) => [item, ...prev]);
-      setSelectedDocIds((prev) => (prev.includes(item.doc_id) ? prev : [item.doc_id, ...prev]));
+      // auto-select the uploaded doc
+      setSelectedDocIds((prev) => (prev.includes(data.doc_id) ? prev : [data.doc_id, ...prev]));
+
       setFile(null);
-
       setChatMessages([]);
       setSummary("");
       setQuestions("");
@@ -309,6 +375,7 @@ function App() {
   };
 
   const buildHistoryPayload = (msgs) => {
+    // keep longer history for better "ChatGPT-like" continuity
     const tail = msgs.slice(-16).map((m) => ({ role: m.role, content: m.content }));
     return tail;
   };
@@ -385,7 +452,6 @@ function App() {
       // replace last pending bubble
       setChatMessages((prev) => {
         const next = [...prev];
-        // find last pending
         for (let i = next.length - 1; i >= 0; i--) {
           if (next[i]?.pending) {
             next[i] = botMsg;
@@ -400,12 +466,28 @@ function App() {
     } catch (e) {
       setError(e?.message || t("Chat error.", "خطأ في الدردشة."));
       pushToast("error", e?.message || t("Chat error.", "خطأ في الدردشة."));
-
-      // remove pending bubble if exists
       setChatMessages((prev) => prev.filter((m) => !m.pending));
     } finally {
       setIsTyping(false);
       setLoadingAction(null);
+    }
+  };
+
+  const handleDeleteDoc = async (doc_id) => {
+    const ok = window.confirm(t("Delete this PDF from library?", "حذف هذا الملف من المكتبة؟"));
+    if (!ok) return;
+
+    try {
+      const res = await fetch(`${API_BASE}/docs/${doc_id}`, { method: "DELETE" });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.detail || "Delete failed.");
+
+      setPdfs((prev) => prev.filter((x) => x.doc_id !== doc_id));
+      setSelectedDocIds((prev) => prev.filter((id) => id !== doc_id));
+
+      pushToast("success", t("Deleted.", "تم الحذف."));
+    } catch (e) {
+      pushToast("error", e?.message || t("Delete error.", "خطأ في الحذف."));
     }
   };
 
@@ -516,7 +598,10 @@ function App() {
           <div className="landingHero">
             <div className="heroKicker">{t("Premium Study Experience", "تجربة مذاكرة فخمة")}</div>
             <div className="heroTitle">
-              {t("Turn PDFs into clean answers, summaries, and exam material.", "حوّل ملفات PDF إلى إجابات مرتبة وملخص وأسئلة امتحانية.")}
+              {t(
+                "Turn PDFs into clean answers, summaries, and exam material.",
+                "حوّل ملفات PDF إلى إجابات مرتبة وملخص وأسئلة امتحانية."
+              )}
             </div>
             <div className="heroSub">
               {t(
@@ -526,7 +611,12 @@ function App() {
             </div>
 
             <div className="heroCTA">
-              <button className="btn primary bigBtn" onClick={() => pushToast("info", t("Start by uploading a PDF from the left panel.", "ابدأ برفع PDF من اللوحة اليسرى."))}>
+              <button
+                className="btn primary bigBtn"
+                onClick={() =>
+                  pushToast("info", t("Start by uploading a PDF from the left panel.", "ابدأ برفع PDF من اللوحة اليسرى."))
+                }
+              >
                 {t("Get Started", "ابدأ الآن")}
               </button>
               <div className="heroMiniNote">
@@ -536,10 +626,26 @@ function App() {
           </div>
 
           <div className="featureGrid">
-            <FeatureCard title={t("Chat with sources", "دردشة مع مصادر")} sub={t("Citations like [S1] + page numbers.", "استشهادات [S1] + أرقام صفحات.")} icon="📌" />
-            <FeatureCard title={t("Multi-PDF", "عدة ملفات")} sub={t("Select multiple PDFs and compare concepts.", "حدد عدة ملفات وقارن المفاهيم.")} icon="📚" />
-            <FeatureCard title={t("Preview instantly", "معاينة فورية")} sub={t("Open the PDF at the cited page.", "افتح الـ PDF على صفحة المصدر.")} icon="🔍" />
-            <FeatureCard title={t("Study modes", "أوضاع مذاكرة")} sub={t("Strict / Simple / Exam-ready.", "صارم / مبسط / امتحاني.")} icon="⚡" />
+            <FeatureCard
+              title={t("Chat with sources", "دردشة مع مصادر")}
+              sub={t("Citations like [S1] + page numbers.", "استشهادات [S1] + أرقام صفحات.")}
+              icon="📌"
+            />
+            <FeatureCard
+              title={t("Multi-PDF", "عدة ملفات")}
+              sub={t("Select multiple PDFs and compare concepts.", "حدد عدة ملفات وقارن المفاهيم.")}
+              icon="📚"
+            />
+            <FeatureCard
+              title={t("Preview instantly", "معاينة فورية")}
+              sub={t("Open the PDF at the cited page.", "افتح الـ PDF على صفحة المصدر.")}
+              icon="🔍"
+            />
+            <FeatureCard
+              title={t("Study modes", "أوضاع مذاكرة")}
+              sub={t("Strict / Simple / Exam-ready / Chatty.", "صارم / مبسط / امتحاني / محادثة.")}
+              icon="⚡"
+            />
           </div>
         </section>
       )}
@@ -596,6 +702,7 @@ function App() {
                           <div className="checkBox">
                             <div className={`checkDot ${checked ? "on" : ""}`} />
                           </div>
+
                           <div className="pdfMeta">
                             <div className="pdfName">{p.filename}</div>
                             <div className="pdfSub">
@@ -603,7 +710,20 @@ function App() {
                               <span className="sep">•</span> <span className="mono">{p.doc_id.slice(0, 8)}</span>
                             </div>
                           </div>
-                          <div className="chip">{checked ? t("Selected", "محدد") : t("Tap", "اضغط")}</div>
+
+                          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                            <div className="chip">{checked ? t("Selected", "محدد") : t("Tap", "اضغط")}</div>
+                            <button
+                              className="tinyBtn"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleDeleteDoc(p.doc_id);
+                              }}
+                              title={t("Delete", "حذف")}
+                            >
+                              {t("Delete", "حذف")}
+                            </button>
+                          </div>
                         </button>
                       );
                     })}
@@ -614,7 +734,7 @@ function App() {
 
             <div className="sideActions">
               <button className="btn ghost" onClick={handleClearPdfs}>
-                {t("Clear PDFs", "مسح الملفات")}
+                {t("Clear Selection", "مسح التحديد")}
               </button>
             </div>
           </section>
@@ -661,23 +781,38 @@ function App() {
                 <div className="label">{t("Mode", "الوضع")}</div>
                 <select value={mode} onChange={(e) => setMode(e.target.value)}>
                   <option value="strict">{t("Strict (PDF only)", "صارم (من الـ PDF فقط)")}</option>
+                  <option value="chatty">{t("Chatty (like ChatGPT)", "محادثة (مثل ChatGPT)")}</option>
                   <option value="simple">{t("Simple", "مبسّط")}</option>
                   <option value="exam">{t("Exam-ready", "إجابة امتحانية")}</option>
-                  <option value="chatty">{t("Chatty (like ChatGPT)", "محادثة (مثل ChatGPT)")}</option>
                 </select>
               </div>
             </div>
 
             <div className="sideActions row">
-              <button className={`btn accent ${isLoading("summary") ? "loading" : ""}`} onClick={handleSummarize} disabled={isLoading("summary")}>
+              <button
+                className={`btn accent ${isLoading("summary") ? "loading" : ""}`}
+                onClick={handleSummarize}
+                disabled={isLoading("summary")}
+              >
                 {isLoading("summary") ? t("Working…", "جاري…") : t("Generate Summary", "إنشاء ملخص")}
               </button>
-              <button className={`btn violet ${isLoading("questions") ? "loading" : ""}`} onClick={handleQuestions} disabled={isLoading("questions")}>
+
+              <button
+                className={`btn violet ${isLoading("questions") ? "loading" : ""}`}
+                onClick={handleQuestions}
+                disabled={isLoading("questions")}
+              >
                 {isLoading("questions") ? t("Working…", "جاري…") : t("Generate Questions", "إنشاء أسئلة")}
               </button>
-              <button className={`btn orange ${isLoading("flashcards") ? "loading" : ""}`} onClick={handleFlashcards} disabled={isLoading("flashcards")}>
+
+              <button
+                className={`btn orange ${isLoading("flashcards") ? "loading" : ""}`}
+                onClick={handleFlashcards}
+                disabled={isLoading("flashcards")}
+              >
                 {isLoading("flashcards") ? t("Working…", "جاري…") : t("Generate Flashcards", "إنشاء بطاقات")}
               </button>
+
               <button className="btn ghost" onClick={handleDownload}>
                 {t("Download Pack", "تحميل ملف المذاكرة")}
               </button>
@@ -733,9 +868,7 @@ function App() {
                   {chatMessages.length === 0 ? (
                     <div className="chatEmpty">
                       <div className="chatEmptyTitle">{t("Start with a question…", "ابدأ بسؤال…")}</div>
-                      <div className="chatEmptySub">
-                        {t("Example: What is class imbalance?", "مثال: ما هو عدم توازن الفئات؟")}
-                      </div>
+                      <div className="chatEmptySub">{t("Example: What is class imbalance?", "مثال: ما هو عدم توازن الفئات؟")}</div>
                     </div>
                   ) : (
                     chatMessages.map((m, idx) => {
@@ -846,10 +979,7 @@ function App() {
 
           <footer className="footer">
             <div className="footNote">
-              {t(
-                "Pro tip: Upload multiple PDFs then select them to compare concepts.",
-                "نصيحة: ارفع عدة ملفات ثم حددها للمقارنة بين المفاهيم."
-              )}
+              {t("Pro tip: Upload multiple PDFs then select them to compare concepts.", "نصيحة: ارفع عدة ملفات ثم حددها للمقارنة بين المفاهيم.")}
             </div>
           </footer>
         </section>
@@ -932,8 +1062,11 @@ function ChatBubble({ role, content, sources, dir, uiLang, pending, onOpenPrevie
           ) : (
             lines.map((line, idx) => {
               const isBullet = line.trim().startsWith("•") || line.trim().startsWith("- ");
-              // headings style
-              const isHeading = line.includes("الخلاصة") || line.includes("Summary") || line.includes("المصادر") || line.includes("Sources");
+              const isHeading =
+                line.includes("الخلاصة") ||
+                line.includes("Summary") ||
+                line.includes("المصادر") ||
+                line.includes("Sources");
               return (
                 <div key={idx} className={`line ${isBullet ? "bullet" : ""} ${isHeading ? "heading" : ""}`}>
                   {renderWithCitations(line, messageLangDir)}
