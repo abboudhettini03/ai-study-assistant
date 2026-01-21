@@ -70,7 +70,10 @@ app = FastAPI(
     title="StudySpark AI API",
     description="Backend for summarizing PDFs, generating questions, flashcards, and chatting with PDFs.",
     version="3.1.0",
+    docs_url="/api-docs",
+    redoc_url="/redoc",
 )
+
 
 # ====== CORS ======
 app.add_middleware(
