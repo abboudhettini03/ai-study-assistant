@@ -198,7 +198,8 @@ class ChatRequest(BaseModel):
     doc_id: Optional[str] = None
 
     message: str
-    mode: str = "strict"  # "strict" | "simple" | "exam"
+    mode: str = "strict"  # "strict" | "simple" | "exam" | "chatty"
+
     lang: str = "auto"    # "auto" | "ar" | "en"
     history: List[Dict[str, str]] = Field(default_factory=list)
 
@@ -307,6 +308,17 @@ Text:
 
 def build_mode_instructions(mode: str) -> str:
     mode = (mode or "strict").strip().lower()
+
+    if mode == "chatty":
+        return (
+            "MODE: CHATTY.\n"
+            "- Be conversational and natural, like ChatGPT.\n"
+            "- Ask ONE short clarifying question if needed.\n"
+            "- Prefer short paragraphs, not rigid bullet templates.\n"
+            "- Use the PDF context as primary; do not invent citations.\n"
+            "- If a detail is not supported by the PDF context, say it is general knowledge.\n"
+        )
+
     if mode == "simple":
         return (
             "MODE: SIMPLE.\n"
@@ -327,6 +339,8 @@ def build_mode_instructions(mode: str) -> str:
         "- Answer ONLY from the provided PDF context.\n"
         "- If missing, say you couldn't find it in the PDF.\n"
     )
+
+
 
 
 def build_output_format(answer_lang: str) -> str:
@@ -401,8 +415,19 @@ async def chat_with_pdf(req: ChatRequest):
         history_text = "\n".join(lines)
 
     mode_instructions = build_mode_instructions(req.mode)
-    out_fmt = build_output_format(answer_lang)
+
+    use_rigid_format = (req.mode or "strict").strip().lower() in ("strict", "exam", "simple")
+    out_fmt = build_output_format(answer_lang) if use_rigid_format else (
+        "OUTPUT (Chatty):\n"
+        "- Write naturally in short paragraphs.\n"
+        "- Use inline citations like [S1] when referencing the PDF.\n"
+        "- If you used any sources, end with a short **Sources** list:\n"
+        "  - S1 — Page 9 — FileName.pdf\n"
+        "- Important for Arabic: do NOT put page numbers inside Arabic sentences.\n"
+    )
+
     lang_rule = "Answer in Arabic only." if answer_lang == "ar" else "Answer in English only."
+
 
     prompt = f"""
 You are a helpful AI assistant.

@@ -309,7 +309,7 @@ function App() {
   };
 
   const buildHistoryPayload = (msgs) => {
-    const tail = msgs.slice(-8).map((m) => ({ role: m.role, content: m.content }));
+    const tail = msgs.slice(-16).map((m) => ({ role: m.role, content: m.content }));
     return tail;
   };
 
@@ -663,6 +663,7 @@ function App() {
                   <option value="strict">{t("Strict (PDF only)", "صارم (من الـ PDF فقط)")}</option>
                   <option value="simple">{t("Simple", "مبسّط")}</option>
                   <option value="exam">{t("Exam-ready", "إجابة امتحانية")}</option>
+                  <option value="chatty">{t("Chatty (like ChatGPT)", "محادثة (مثل ChatGPT)")}</option>
                 </select>
               </div>
             </div>
