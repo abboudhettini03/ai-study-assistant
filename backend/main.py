@@ -10,6 +10,14 @@ import uuid
 from typing import Dict, List, Any, Optional
 from datetime import datetime
 
+from fastapi.responses import StreamingResponse
+import json
+import time
+from typing import Dict, Any
+
+import re
+from collections import defaultdict
+
 from sklearn.feature_extraction.text import TfidfVectorizer  # type: ignore
 from sklearn.metrics.pairwise import cosine_similarity  # type: ignore
 
@@ -544,9 +552,52 @@ Text:
     return {"flashcards": flashcards}
 
 
-# ====== Chat ======
-@app.post("/chat")
-async def chat_with_pdf(req: ChatRequest):
+
+def _tokenize_simple(s: str) -> list[str]:
+    s = (s or "").lower()
+    s = re.sub(r"[^a-z0-9\u0600-\u06ff\s]+", " ", s)
+    toks = [t for t in s.split() if len(t) >= 2]
+    return toks
+
+def _keyword_overlap_boost(query: str, chunk_text: str) -> float:
+    q = set(_tokenize_simple(query))
+    if not q:
+        return 0.0
+    c = set(_tokenize_simple(chunk_text))
+    hit = len(q.intersection(c))
+    return hit / max(6, len(q))  # small normalized boost
+
+def rerank_hits(query: str, hits: list[dict], alpha: float = 0.25) -> list[dict]:
+    # hits: [{doc_id, idx, score, page, text, ...}]
+    for h in hits:
+        boost = _keyword_overlap_boost(query, h.get("text", ""))
+        h["score2"] = float(h.get("score", 0.0)) + alpha * boost
+    hits.sort(key=lambda x: x.get("score2", x.get("score", 0.0)), reverse=True)
+    return hits
+
+def diversify_hits(hits: list[dict], max_per_page: int = 1, max_per_doc: int = 4, k: int = 8) -> list[dict]:
+    picked = []
+    per_doc = defaultdict(int)
+    per_page = defaultdict(int)  # key: (doc_id, page)
+
+    for h in hits:
+        doc_id = h.get("doc_id")
+        page = int(h.get("page") or 0)
+        if per_doc[doc_id] >= max_per_doc:
+            continue
+        if per_page[(doc_id, page)] >= max_per_page:
+            continue
+
+        picked.append(h)
+        per_doc[doc_id] += 1
+        per_page[(doc_id, page)] += 1
+        if len(picked) >= k:
+            break
+
+    return picked
+
+
+async def run_chat_logic(req: ChatRequest) -> Dict[str, Any]:
     doc_ids = req.doc_ids if req.doc_ids else ([req.doc_id] if req.doc_id else [])
     doc_ids = [d for d in doc_ids if d and d in DOC_STORE]
 
@@ -561,13 +612,22 @@ async def chat_with_pdf(req: ChatRequest):
         answer_lang = user_lang
 
     retrieval_query = translate_to_english_if_needed(req.message)
-    retrieved = merge_retrieval(doc_ids, retrieval_query, top_k_total=7, k_per_doc=5)
+
+    hits = merge_retrieval(doc_ids, retrieval_query, top_k_total=12, k_per_doc=5)
+    hits = rerank_hits(retrieval_query, hits, alpha=0.35)
+    hits = diversify_hits(hits, max_per_page=1, max_per_doc=3, k=8)
+
+    for i, item in enumerate(hits, start=1):
+        item["id"] = f"S{i}"
+
+    retrieved = hits
 
     if (not retrieved) or (retrieved[0].get("score", 0.0) < 0.05):
         if answer_lang == "ar":
             return {"answer": "لم أجد محتوى مناسبًا داخل الـ PDF(s) المحددة للإجابة على سؤالك.", "sources": [], "answer_lang": "ar"}
         return {"answer": "I couldn't find relevant content in the selected PDF(s).", "sources": [], "answer_lang": "en"}
 
+    # ====== build context (نفس كودك القديم) ======
     numbered_context = []
     for item in retrieved:
         meta = DOC_META.get(item["doc_id"], {})
@@ -577,6 +637,7 @@ async def chat_with_pdf(req: ChatRequest):
         )
     context = "\n\n---\n\n".join(numbered_context)
 
+    # ====== history (نفس كودك القديم) ======
     history_text = ""
     if req.history:
         last = req.history[-16:]
@@ -625,8 +686,11 @@ User Question:
 
 {lang_rule}
 """
-    answer = call_llm(prompt)
 
+    # ✅ مهم: call_llm عندك غالبًا async
+    answer = await call_llm(prompt)
+
+    # ====== sources (نفس كودك القديم) ======
     sources = []
     for item in retrieved:
         meta = DOC_META.get(item["doc_id"], {})
@@ -642,6 +706,34 @@ User Question:
         )
 
     return {"answer": answer, "sources": sources, "answer_lang": answer_lang}
+
+
+@app.post("/chat")
+async def chat_with_pdf(req: ChatRequest):
+    return await run_chat_logic(req)
+
+
+@app.post("/chat-stream")
+async def chat_stream(req: ChatRequest):
+    result = await run_chat_logic(req)
+
+    answer = result.get("answer", "")
+    sources = result.get("sources", [])
+    answer_lang = result.get("answer_lang", "en")
+
+    def gen():
+        yield f"event: meta\ndata: {json.dumps({'answer_lang': answer_lang})}\n\n"
+
+        chunk_size = 80
+        for i in range(0, len(answer), chunk_size):
+            part = answer[i:i+chunk_size]
+            yield f"event: delta\ndata: {json.dumps({'text': part})}\n\n"
+            time.sleep(0.01)
+
+        yield f"event: sources\ndata: {json.dumps({'sources': sources})}\n\n"
+        yield "event: done\ndata: {}\n\n"
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
 
 
 @app.get("/")
