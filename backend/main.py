@@ -736,7 +736,7 @@ async def chat_stream(req: ChatRequest):
     async def gen():   # 🔴 مهم: async def
         yield f"event: meta\ndata: {json.dumps({'answer_lang': answer_lang})}\n\n"
 
-        chunk_size = 80
+        chunk_size = 24
         for i in range(0, len(answer), chunk_size):
             part = answer[i:i+chunk_size]
             yield f"event: delta\ndata: {json.dumps({'text': part})}\n\n"
