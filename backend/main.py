@@ -699,7 +699,8 @@ User Question:
 """
 
     # ✅ مهم: call_llm عندك غالبًا async
-    answer = await call_llm(prompt)
+    answer = call_llm(prompt)
+
 
     # ====== sources (نفس كودك القديم) ======
     sources = []
