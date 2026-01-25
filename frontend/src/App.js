@@ -4,6 +4,20 @@ import "./App.css";
 const API_BASE =
   process.env.REACT_APP_API_BASE || "https://ai-study-assistant-j5eu.onrender.com";
 
+
+  
+function getClientId() {
+  const key = "studyspark_client_id";
+  let v = localStorage.getItem(key);
+  if (!v) {
+    v = (crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`).toString();
+    localStorage.setItem(key, v);
+  }
+  return v;
+}
+const CLIENT_ID = getClientId();
+
+
 function hasArabic(text = "") {
   return /[\u0600-\u06FF]/.test(text);
 }
@@ -105,7 +119,7 @@ function App() {
 
   // ====== Load docs from server
   const refreshDocs = async () => {
-    const res = await fetch(`${API_BASE}/docs`);
+    const res = await fetch(`${API_BASE}/docs?client_id=${encodeURIComponent(CLIENT_ID)}`);
     const data = await res.json();
     if (!res.ok) throw new Error(data?.detail || "Failed to load docs.");
     const items = (data || []).map((d) => ({
@@ -166,7 +180,7 @@ function App() {
     // If selecting and text missing, lazy-load it
     if (!alreadySelected && doc && !doc.text) {
       try {
-        const res = await fetch(`${API_BASE}/docs/${doc_id}`);
+        const res = await fetch(`${API_BASE}/docs/${doc_id}?client_id=${encodeURIComponent(CLIENT_ID)}`);
         const data = await res.json();
         if (!res.ok) throw new Error(data?.detail || "Failed to load doc text.");
 
@@ -226,6 +240,8 @@ function App() {
     try {
       const form = new FormData();
       form.append("file", file);
+      form.append("client_id", CLIENT_ID);
+
 
       const res = await fetch(`${API_BASE}/upload`, { method: "POST", body: form });
       const data = await res.json();
@@ -422,6 +438,7 @@ function App() {
 
   try {
     const payload = {
+      client_id: CLIENT_ID,
       doc_ids: selectedDocIds,
       message: msg,
       mode,
@@ -568,7 +585,11 @@ function App() {
     if (!ok) return;
 
     try {
-      const res = await fetch(`${API_BASE}/docs/${doc_id}`, { method: "DELETE" });
+      const res = await fetch(
+        `${API_BASE}/docs/${doc_id}?client_id=${encodeURIComponent(CLIENT_ID)}`,
+        { method: "DELETE" }
+      );
+
       const data = await res.json();
       if (!res.ok) throw new Error(data?.detail || "Delete failed.");
 

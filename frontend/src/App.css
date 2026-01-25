@@ -1014,3 +1014,76 @@ a{ color: inherit; text-decoration: none; }
   font-size: 12px;
   line-height: 1.45;
 }
+
+
+/* ===== Mobile Responsive ===== */
+@media (max-width: 900px) {
+  .layout {
+    display: flex !important;
+    flex-direction: column !important;
+    gap: 14px !important;
+  }
+
+  .side {
+    width: 100% !important;
+    max-width: 100% !important;
+  }
+
+  .main {
+    width: 100% !important;
+    max-width: 100% !important;
+  }
+
+  .card.big {
+    padding: 12px !important;
+  }
+
+  .chatComposer {
+    display: flex !important;
+    flex-direction: column !important;
+    gap: 10px !important;
+  }
+
+  .chatComposer textarea {
+    min-height: 84px !important;
+  }
+
+  .btn.bigBtn {
+    width: 100% !important;
+  }
+
+  .tabs {
+    flex-wrap: wrap !important;
+    gap: 8px !important;
+  }
+
+  .pdfItem {
+    width: 100% !important;
+  }
+
+  .modalCard {
+    width: 94vw !important;
+    height: 86vh !important;
+  }
+
+  .pdfFrame {
+    width: 100% !important;
+    height: 72vh !important;
+  }
+}
+
+@media (max-width: 520px) {
+  .topBar {
+    flex-direction: column !important;
+    gap: 10px !important;
+    align-items: flex-start !important;
+  }
+
+  .tinyMeta {
+    display: none !important;
+  }
+
+  .featureGrid {
+    grid-template-columns: 1fr !important;
+  }
+}
