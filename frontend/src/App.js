@@ -4,8 +4,6 @@ import "./App.css";
 const API_BASE =
   process.env.REACT_APP_API_BASE || "https://ai-study-assistant-j5eu.onrender.com";
 
-
-  
 function getClientId() {
   const key = "studyspark_client_id";
   let v = localStorage.getItem(key);
@@ -16,7 +14,6 @@ function getClientId() {
   return v;
 }
 const CLIENT_ID = getClientId();
-
 
 function hasArabic(text = "") {
   return /[\u0600-\u06FF]/.test(text);
@@ -117,9 +114,11 @@ function App() {
     }, 3400);
   };
 
-  // ====== Load docs from server
+  // ====== Load docs from server (isolated by CLIENT_ID)
   const refreshDocs = async () => {
-    const res = await fetch(`${API_BASE}/docs?client_id=${encodeURIComponent(CLIENT_ID)}`);
+    const res = await fetch(
+      `${API_BASE}/docs?client_id=${encodeURIComponent(CLIENT_ID)}`
+    );
     const data = await res.json();
     if (!res.ok) throw new Error(data?.detail || "Failed to load docs.");
     const items = (data || []).map((d) => ({
@@ -137,8 +136,7 @@ function App() {
       try {
         await refreshDocs();
       } catch (e) {
-        // keep silent-ish to avoid annoying; you can enable toast if you want
-        // pushToast("error", e?.message || "Failed to load library.");
+        // optional toast
       }
     };
     load();
@@ -151,11 +149,7 @@ function App() {
 
   // Keep the big text area synced with selected PDFs
   useEffect(() => {
-    if (selectedPdfs.length === 0) {
-      // if none selected, do not force-clear user typed text; keep current behavior? (you can uncomment next line)
-      // setText("");
-      return;
-    }
+    if (selectedPdfs.length === 0) return;
     const combined = selectedPdfs
       .map((p) => p.text || "")
       .filter(Boolean)
@@ -170,17 +164,18 @@ function App() {
     setError("");
   };
 
-  // Select/deselect + lazy-load document text
+  // Select/deselect + lazy-load document text (isolated by CLIENT_ID)
   const toggleSelect = async (doc_id) => {
     setError("");
 
     const alreadySelected = selectedDocIds.includes(doc_id);
     const doc = pdfs.find((p) => p.doc_id === doc_id);
 
-    // If selecting and text missing, lazy-load it
     if (!alreadySelected && doc && !doc.text) {
       try {
-        const res = await fetch(`${API_BASE}/docs/${doc_id}?client_id=${encodeURIComponent(CLIENT_ID)}`);
+        const res = await fetch(
+          `${API_BASE}/docs/${doc_id}?client_id=${encodeURIComponent(CLIENT_ID)}`
+        );
         const data = await res.json();
         if (!res.ok) throw new Error(data?.detail || "Failed to load doc text.");
 
@@ -210,7 +205,6 @@ function App() {
   };
 
   const handleClearPdfs = async () => {
-    // This clears local UI state only (does NOT delete server docs)
     setSelectedDocIds([]);
     setText("");
     setSummary("");
@@ -219,14 +213,12 @@ function App() {
     setChatMessages([]);
     setError("");
     pushToast("info", t("Selection cleared.", "تم مسح التحديد."));
-    // If you want to reload from server too:
     try {
       await refreshDocs();
-    } catch {
-      // ignore
-    }
+    } catch {}
   };
 
+  // Upload (must include client_id)
   const handleUpload = async () => {
     if (!file) {
       setError(t("Please choose a PDF first.", "اختر ملف PDF أولاً."));
@@ -240,8 +232,7 @@ function App() {
     try {
       const form = new FormData();
       form.append("file", file);
-      form.append("client_id", CLIENT_ID);
-
+      form.append("client_id", CLIENT_ID); // ✅ مهم
 
       const res = await fetch(`${API_BASE}/upload`, { method: "POST", body: form });
       const data = await res.json();
@@ -249,10 +240,8 @@ function App() {
       if (!res.ok) throw new Error(data?.detail || "Upload failed.");
       if (!data?.doc_id) throw new Error(data?.message || "No doc_id returned.");
 
-      // refresh library from server (source of truth)
       await refreshDocs();
 
-      // auto-select the uploaded doc
       setSelectedDocIds((prev) => (prev.includes(data.doc_id) ? prev : [data.doc_id, ...prev]));
 
       setFile(null);
@@ -391,13 +380,11 @@ function App() {
   };
 
   const buildHistoryPayload = (msgs) => {
-    // keep longer history for better "ChatGPT-like" continuity
     const tail = msgs.slice(-16).map((m) => ({ role: m.role, content: m.content }));
     return tail;
   };
 
   const openPreview = (source) => {
-    // iframe supports #page=
     setPreview({
       open: true,
       doc_id: source.doc_id,
@@ -407,178 +394,172 @@ function App() {
   };
 
   const handleChatSend = async () => {
-  const msg = chatInput.trim();
-  if (!msg) return;
+    const msg = chatInput.trim();
+    if (!msg) return;
 
-  if (selectedDocIds.length === 0) {
-    setError(t("Select at least one PDF first.", "اختر ملف PDF واحد على الأقل أولاً."));
-    pushToast("error", t("Select PDFs first.", "اختر ملفات أولاً."));
-    return;
-  }
-  if (loadingAction === "chat") return;
+    if (selectedDocIds.length === 0) {
+      setError(t("Select at least one PDF first.", "اختر ملف PDF واحد على الأقل أولاً."));
+      pushToast("error", t("Select PDFs first.", "اختر ملفات أولاً."));
+      return;
+    }
+    if (loadingAction === "chat") return;
 
-  const userLang = hasArabic(msg) ? "ar" : "en";
-  const userMsg = { role: "user", content: msg, sources: [], lang: userLang };
+    const userLang = hasArabic(msg) ? "ar" : "en";
+    const userMsg = { role: "user", content: msg, sources: [], lang: userLang };
 
-  // add user + pending assistant skeleton bubble
-  const pendingBot = {
-    role: "assistant",
-    content: "",
-    sources: [],
-    lang: uiLang === "ar" ? "ar" : "en",
-    pending: true,
-  };
-
-  setChatMessages((prev) => [...prev, userMsg, pendingBot]);
-  setChatInput("");
-
-  setLoadingAction("chat");
-  setIsTyping(true);
-  setError("");
-
-  try {
-    const payload = {
-      client_id: CLIENT_ID,
-      doc_ids: selectedDocIds,
-      message: msg,
-      mode,
-      lang: "auto",
-      history: buildHistoryPayload([...chatMessages, userMsg]),
+    const pendingBot = {
+      role: "assistant",
+      content: "",
+      sources: [],
+      lang: uiLang === "ar" ? "ar" : "en",
+      pending: true,
     };
 
-    const res = await fetch(`${API_BASE}/chat-stream`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
+    setChatMessages((prev) => [...prev, userMsg, pendingBot]);
+    setChatInput("");
 
-    if (!res.ok) {
-      const txt = await res.text();
-      throw new Error((txt || "").slice(0, 200) || "Chat failed.");
-    }
+    setLoadingAction("chat");
+    setIsTyping(true);
+    setError("");
 
-    if (!res.body) throw new Error("Streaming not supported by the browser.");
+    try {
+      const payload = {
+        client_id: CLIENT_ID,
+        doc_ids: selectedDocIds,
+        message: msg,
+        mode,
+        lang: "auto",
+        history: buildHistoryPayload([...chatMessages, userMsg]),
+      };
 
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder("utf-8");
-
-    let buffer = "";
-    let accumulated = "";
-    let finalAnswerLang = hasArabic(msg) ? "ar" : "en";
-    let finalSources = [];
-
-    const updatePending = (partialText, langGuess) => {
-      setChatMessages((prev) => {
-        const next = [...prev];
-        for (let i = next.length - 1; i >= 0; i--) {
-          if (next[i]?.pending) {
-            next[i] = { ...next[i], content: partialText, lang: langGuess || next[i].lang };
-            break;
-          }
-        }
-        return next;
+      const res = await fetch(`${API_BASE}/chat-stream`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
       });
-    };
 
-    let finalized = false;
+      if (!res.ok) {
+        const txt = await res.text();
+        throw new Error((txt || "").slice(0, 200) || "Chat failed.");
+      }
 
-    const finalize = () => {
-  if (finalized) return;
-  finalized = true;
-  const botMsg = {
-    role: "assistant",
-    content: accumulated,
-    sources: finalSources,
-    lang: finalAnswerLang,
-    pending: false,
+      if (!res.body) throw new Error("Streaming not supported by the browser.");
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+
+      let buffer = "";
+      let accumulated = "";
+      let finalAnswerLang = hasArabic(msg) ? "ar" : "en";
+      let finalSources = [];
+
+      const updatePending = (partialText, langGuess) => {
+        setChatMessages((prev) => {
+          const next = [...prev];
+          for (let i = next.length - 1; i >= 0; i--) {
+            if (next[i]?.pending) {
+              next[i] = { ...next[i], content: partialText, lang: langGuess || next[i].lang };
+              break;
+            }
+          }
+          return next;
+        });
+      };
+
+      let finalized = false;
+
+      const finalize = () => {
+        if (finalized) return;
+        finalized = true;
+        const botMsg = {
+          role: "assistant",
+          content: accumulated,
+          sources: finalSources,
+          lang: finalAnswerLang,
+          pending: false,
+        };
+
+        setChatMessages((prev) => {
+          const next = [...prev];
+          for (let i = next.length - 1; i >= 0; i--) {
+            if (next[i]?.pending) {
+              next[i] = botMsg;
+              return next;
+            }
+          }
+          return [...next, botMsg];
+        });
+      };
+
+      const handleEventBlock = (block) => {
+        const lines = block.split("\n");
+        let eventName = "message";
+        let dataStr = "";
+
+        for (const line of lines) {
+          if (line.startsWith("event:")) eventName = line.replace("event:", "").trim();
+          if (line.startsWith("data:")) dataStr += line.replace("data:", "").trim();
+        }
+
+        if (!dataStr) return;
+
+        let obj = null;
+        try {
+          obj = JSON.parse(dataStr);
+        } catch {
+          obj = null;
+        }
+
+        if (eventName === "meta") {
+          if (obj?.answer_lang) finalAnswerLang = obj.answer_lang;
+          return;
+        }
+
+        if (eventName === "delta") {
+          const part = obj?.text || "";
+          accumulated += part;
+          updatePending(accumulated, finalAnswerLang);
+          return;
+        }
+
+        if (eventName === "sources") {
+          finalSources = obj?.sources || [];
+          return;
+        }
+
+        if (eventName === "done") {
+          finalize();
+          return;
+        }
+      };
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+
+        let idx;
+        while ((idx = buffer.indexOf("\n\n")) !== -1) {
+          const block = buffer.slice(0, idx);
+          buffer = buffer.slice(idx + 2);
+          if (block.trim()) handleEventBlock(block);
+        }
+      }
+
+      if (!finalized) finalize();
+
+      setTab("chat");
+      pushToast("success", t("Answer ready.", "تمت الإجابة."));
+    } catch (e) {
+      setError(e?.message || t("Chat error.", "خطأ في الدردشة."));
+      pushToast("error", e?.message || t("Chat error.", "خطأ في الدردشة."));
+      setChatMessages((prev) => prev.filter((m) => !m.pending));
+    } finally {
+      setIsTyping(false);
+      setLoadingAction(null);
+    }
   };
-
-  setChatMessages((prev) => {
-    const next = [...prev];
-    for (let i = next.length - 1; i >= 0; i--) {
-      if (next[i]?.pending) {
-        next[i] = botMsg;
-        return next;
-      }
-    }
-    return [...next, botMsg];
-  });
-};
-
-
-    const handleEventBlock = (block) => {
-      const lines = block.split("\n");
-      let eventName = "message";
-      let dataStr = "";
-
-      for (const line of lines) {
-        if (line.startsWith("event:")) eventName = line.replace("event:", "").trim();
-        if (line.startsWith("data:")) dataStr += line.replace("data:", "").trim();
-      }
-
-      if (!dataStr) return;
-
-      let obj = null;
-      try {
-        obj = JSON.parse(dataStr);
-      } catch {
-        obj = null;
-      }
-
-      if (eventName === "meta") {
-        if (obj?.answer_lang) finalAnswerLang = obj.answer_lang;
-        return;
-      }
-
-      if (eventName === "delta") {
-        const part = obj?.text || "";
-        accumulated += part;
-        updatePending(accumulated, finalAnswerLang);
-        return;
-      }
-
-      if (eventName === "sources") {
-        finalSources = obj?.sources || [];
-        return;
-      }
-
-      if (eventName === "done") {
-        finalize();
-        return;
-      }
-    };
-
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-
-      buffer += decoder.decode(value, { stream: true });
-
-      // SSE blocks separated by blank line
-      let idx;
-      while ((idx = buffer.indexOf("\n\n")) !== -1) {
-        const block = buffer.slice(0, idx);
-        buffer = buffer.slice(idx + 2);
-        if (block.trim()) handleEventBlock(block);
-      }
-    }
-
-    // لو انتهى الستريم بدون "done"
-    if (!finalized) finalize();
-
-
-    setTab("chat");
-    pushToast("success", t("Answer ready.", "تمت الإجابة."));
-  } catch (e) {
-    setError(e?.message || t("Chat error.", "خطأ في الدردشة."));
-    pushToast("error", e?.message || t("Chat error.", "خطأ في الدردشة."));
-    setChatMessages((prev) => prev.filter((m) => !m.pending));
-  } finally {
-    setIsTyping(false);
-    setLoadingAction(null);
-  }
-};
-
 
   const handleDeleteDoc = async (doc_id) => {
     const ok = window.confirm(t("Delete this PDF from library?", "حذف هذا الملف من المكتبة؟"));
@@ -601,6 +582,32 @@ function App() {
       pushToast("error", e?.message || t("Delete error.", "خطأ في الحذف."));
     }
   };
+
+  // ✅ IMPORTANT: clear this client's docs when closing tab / leaving (best-effort)
+  useEffect(() => {
+    const clearOnUnload = () => {
+      const url = `${API_BASE}/clear`;
+      const payload = JSON.stringify({ client_id: CLIENT_ID });
+
+      // try sendBeacon first
+      if (navigator.sendBeacon) {
+        const blob = new Blob([payload], { type: "application/json" });
+        navigator.sendBeacon(url, blob);
+        return;
+      }
+
+      // fallback fetch keepalive
+      fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: payload,
+        keepalive: true,
+      }).catch(() => {});
+    };
+
+    window.addEventListener("beforeunload", clearOnUnload);
+    return () => window.removeEventListener("beforeunload", clearOnUnload);
+  }, []);
 
   const brand = {
     name: "StudySpark AI",
@@ -645,7 +652,9 @@ function App() {
               <div className="modalActions">
                 <a
                   className="tinyBtn"
-                  href={`${API_BASE}/pdf/${preview.doc_id}#page=${preview.page}`}
+                  href={`${API_BASE}/pdf/${preview.doc_id}?client_id=${encodeURIComponent(
+                    CLIENT_ID
+                  )}#page=${preview.page}`}
                   target="_blank"
                   rel="noreferrer"
                 >
@@ -661,7 +670,9 @@ function App() {
               <iframe
                 title="pdf-preview"
                 className="pdfFrame"
-                src={`${API_BASE}/pdf/${preview.doc_id}#page=${preview.page}`}
+                src={`${API_BASE}/pdf/${preview.doc_id}?client_id=${encodeURIComponent(
+                  CLIENT_ID
+                )}#page=${preview.page}`}
               />
             </div>
           </div>
@@ -679,16 +690,10 @@ function App() {
 
         <div className="topActions">
           <div className="pillToggle">
-            <button
-              className={`pill ${uiLang === "en" ? "active" : ""}`}
-              onClick={() => setUiLang("en")}
-            >
+            <button className={`pill ${uiLang === "en" ? "active" : ""}`} onClick={() => setUiLang("en")}>
               EN
             </button>
-            <button
-              className={`pill ${uiLang === "ar" ? "active" : ""}`}
-              onClick={() => setUiLang("ar")}
-            >
+            <button className={`pill ${uiLang === "ar" ? "active" : ""}`} onClick={() => setUiLang("ar")}>
               AR
             </button>
           </div>
@@ -709,16 +714,10 @@ function App() {
           <div className="landingHero">
             <div className="heroKicker">{t("Premium Study Experience", "تجربة مذاكرة فخمة")}</div>
             <div className="heroTitle">
-              {t(
-                "Turn PDFs into clean answers, summaries, and exam material.",
-                "حوّل ملفات PDF إلى إجابات مرتبة وملخص وأسئلة امتحانية."
-              )}
+              {t("Turn PDFs into clean answers, summaries, and exam material.", "حوّل ملفات PDF إلى إجابات مرتبة وملخص وأسئلة امتحانية.")}
             </div>
             <div className="heroSub">
-              {t(
-                "Upload multiple PDFs, ask in Arabic or English, and cite sources with page numbers — instantly.",
-                "ارفع عدة ملفات، اسأل بالعربي أو الإنجليزي، واحصل على استشهادات مع أرقام الصفحات فورًا."
-              )}
+              {t("Upload multiple PDFs, ask in Arabic or English, and cite sources with page numbers — instantly.", "ارفع عدة ملفات، اسأل بالعربي أو الإنجليزي، واحصل على استشهادات مع أرقام الصفحات فورًا.")}
             </div>
 
             <div className="heroCTA">
@@ -730,33 +729,15 @@ function App() {
               >
                 {t("Get Started", "ابدأ الآن")}
               </button>
-              <div className="heroMiniNote">
-                {t("No accounts yet — just pure productivity.", "بدون حسابات حالياً — إنتاجية مباشرة.")}
-              </div>
+              <div className="heroMiniNote">{t("No accounts yet — just pure productivity.", "بدون حسابات حالياً — إنتاجية مباشرة.")}</div>
             </div>
           </div>
 
           <div className="featureGrid">
-            <FeatureCard
-              title={t("Chat with sources", "دردشة مع مصادر")}
-              sub={t("Citations like [S1] + page numbers.", "استشهادات [S1] + أرقام صفحات.")}
-              icon="📌"
-            />
-            <FeatureCard
-              title={t("Multi-PDF", "عدة ملفات")}
-              sub={t("Select multiple PDFs and compare concepts.", "حدد عدة ملفات وقارن المفاهيم.")}
-              icon="📚"
-            />
-            <FeatureCard
-              title={t("Preview instantly", "معاينة فورية")}
-              sub={t("Open the PDF at the cited page.", "افتح الـ PDF على صفحة المصدر.")}
-              icon="🔍"
-            />
-            <FeatureCard
-              title={t("Study modes", "أوضاع مذاكرة")}
-              sub={t("Strict / Simple / Exam-ready / Chatty.", "صارم / مبسط / امتحاني / محادثة.")}
-              icon="⚡"
-            />
+            <FeatureCard title={t("Chat with sources", "دردشة مع مصادر")} sub={t("Citations like [S1] + page numbers.", "استشهادات [S1] + أرقام صفحات.")} icon="📌" />
+            <FeatureCard title={t("Multi-PDF", "عدة ملفات")} sub={t("Select multiple PDFs and compare concepts.", "حدد عدة ملفات وقارن المفاهيم.")} icon="📚" />
+            <FeatureCard title={t("Preview instantly", "معاينة فورية")} sub={t("Open the PDF at the cited page.", "افتح الـ PDF على صفحة المصدر.")} icon="🔍" />
+            <FeatureCard title={t("Study modes", "أوضاع مذاكرة")} sub={t("Strict / Simple / Exam-ready / Chatty.", "صارم / مبسط / امتحاني / محادثة.")} icon="⚡" />
           </div>
         </section>
       )}
@@ -776,11 +757,7 @@ function App() {
                 <span>{file ? file.name : t("Choose PDF", "اختر PDF")}</span>
               </label>
 
-              <button
-                className={`btn primary ${isLoading("upload") ? "loading" : ""}`}
-                onClick={handleUpload}
-                disabled={isLoading("upload")}
-              >
+              <button className={`btn primary ${isLoading("upload") ? "loading" : ""}`} onClick={handleUpload} disabled={isLoading("upload")}>
                 {isLoading("upload") ? t("Uploading…", "جاري الرفع…") : t("Upload & Extract", "رفع واستخراج")}
               </button>
             </div>
@@ -804,12 +781,7 @@ function App() {
                     {pdfs.map((p) => {
                       const checked = selectedDocIds.includes(p.doc_id);
                       return (
-                        <button
-                          key={p.doc_id}
-                          className={`pdfItem ${checked ? "checked" : ""}`}
-                          onClick={() => toggleSelect(p.doc_id)}
-                          title={p.filename}
-                        >
+                        <button key={p.doc_id} className={`pdfItem ${checked ? "checked" : ""}`} onClick={() => toggleSelect(p.doc_id)} title={p.filename}>
                           <div className="checkBox">
                             <div className={`checkDot ${checked ? "on" : ""}`} />
                           </div>
@@ -817,8 +789,8 @@ function App() {
                           <div className="pdfMeta">
                             <div className="pdfName">{p.filename}</div>
                             <div className="pdfSub">
-                              {t("Pages:", "الصفحات:")} <span>{p.num_pages ?? "—"}</span>{" "}
-                              <span className="sep">•</span> <span className="mono">{p.doc_id.slice(0, 8)}</span>
+                              {t("Pages:", "الصفحات:")} <span>{p.num_pages ?? "—"}</span> <span className="sep">•</span>{" "}
+                              <span className="mono">{p.doc_id.slice(0, 8)}</span>
                             </div>
                           </div>
 
@@ -868,24 +840,12 @@ function App() {
 
               <div className="field">
                 <div className="label">{t("# Questions", "عدد الأسئلة")}</div>
-                <input
-                  type="number"
-                  min={1}
-                  max={20}
-                  value={numQuestions}
-                  onChange={(e) => setNumQuestions(clamp(Number(e.target.value || 5), 1, 20))}
-                />
+                <input type="number" min={1} max={20} value={numQuestions} onChange={(e) => setNumQuestions(clamp(Number(e.target.value || 5), 1, 20))} />
               </div>
 
               <div className="field">
                 <div className="label">{t("# Flashcards", "عدد البطاقات")}</div>
-                <input
-                  type="number"
-                  min={1}
-                  max={30}
-                  value={numCards}
-                  onChange={(e) => setNumCards(clamp(Number(e.target.value || 6), 1, 30))}
-                />
+                <input type="number" min={1} max={30} value={numCards} onChange={(e) => setNumCards(clamp(Number(e.target.value || 6), 1, 30))} />
               </div>
 
               <div className="field">
@@ -900,27 +860,15 @@ function App() {
             </div>
 
             <div className="sideActions row">
-              <button
-                className={`btn accent ${isLoading("summary") ? "loading" : ""}`}
-                onClick={handleSummarize}
-                disabled={isLoading("summary")}
-              >
+              <button className={`btn accent ${isLoading("summary") ? "loading" : ""}`} onClick={handleSummarize} disabled={isLoading("summary")}>
                 {isLoading("summary") ? t("Working…", "جاري…") : t("Generate Summary", "إنشاء ملخص")}
               </button>
 
-              <button
-                className={`btn violet ${isLoading("questions") ? "loading" : ""}`}
-                onClick={handleQuestions}
-                disabled={isLoading("questions")}
-              >
+              <button className={`btn violet ${isLoading("questions") ? "loading" : ""}`} onClick={handleQuestions} disabled={isLoading("questions")}>
                 {isLoading("questions") ? t("Working…", "جاري…") : t("Generate Questions", "إنشاء أسئلة")}
               </button>
 
-              <button
-                className={`btn orange ${isLoading("flashcards") ? "loading" : ""}`}
-                onClick={handleFlashcards}
-                disabled={isLoading("flashcards")}
-              >
+              <button className={`btn orange ${isLoading("flashcards") ? "loading" : ""}`} onClick={handleFlashcards} disabled={isLoading("flashcards")}>
                 {isLoading("flashcards") ? t("Working…", "جاري…") : t("Generate Flashcards", "إنشاء بطاقات")}
               </button>
 
@@ -963,12 +911,7 @@ function App() {
                 <div className="chatHeader">
                   <div>
                     <div className="hTitle">{t("Chat with selected PDFs", "الدردشة مع الملفات المحددة")}</div>
-                    <div className="hSub">
-                      {t(
-                        "Tip: Ask in Arabic or English — citations stay clean.",
-                        "نصيحة: اسأل بالعربي أو الإنجليزي — والاستشهادات ستبقى مرتبة."
-                      )}
-                    </div>
+                    <div className="hSub">{t("Tip: Ask in Arabic or English — citations stay clean.", "نصيحة: اسأل بالعربي أو الإنجليزي — والاستشهادات ستبقى مرتبة.")}</div>
                   </div>
                   <button className="btn ghost" onClick={handleClearChat}>
                     {t("Clear chat", "مسح الدردشة")}
@@ -1018,11 +961,7 @@ function App() {
                     }}
                     disabled={loadingAction === "chat"}
                   />
-                  <button
-                    className={`btn primary bigBtn ${loadingAction === "chat" ? "loading" : ""}`}
-                    onClick={handleChatSend}
-                    disabled={loadingAction === "chat"}
-                  >
+                  <button className={`btn primary bigBtn ${loadingAction === "chat" ? "loading" : ""}`} onClick={handleChatSend} disabled={loadingAction === "chat"}>
                     {loadingAction === "chat" ? t("Sending…", "جاري الإرسال…") : t("Send", "إرسال")}
                   </button>
                 </div>
@@ -1035,21 +974,12 @@ function App() {
                 <div className="split">
                   <div className="panel">
                     <div className="panelTitle">{t("Extracted / Input Text", "النص المستخرج / المدخل")}</div>
-                    <textarea
-                      className="bigText"
-                      value={text}
-                      onChange={(e) => setText(e.target.value)}
-                      placeholder={t("Paste notes here…", "الصق ملاحظاتك هنا…")}
-                    />
+                    <textarea className="bigText" value={text} onChange={(e) => setText(e.target.value)} placeholder={t("Paste notes here…", "الصق ملاحظاتك هنا…")} />
                   </div>
 
                   <div className="panel">
                     <div className="panelTitle">
-                      {tab === "summary"
-                        ? t("Summary", "الملخص")
-                        : tab === "questions"
-                        ? t("Questions", "الأسئلة")
-                        : t("Flashcards", "البطاقات")}
+                      {tab === "summary" ? t("Summary", "الملخص") : tab === "questions" ? t("Questions", "الأسئلة") : t("Flashcards", "البطاقات")}
                     </div>
 
                     <div className="outputBox" dir={uiLang === "ar" ? "rtl" : "ltr"}>
@@ -1089,9 +1019,7 @@ function App() {
           </section>
 
           <footer className="footer">
-            <div className="footNote">
-              {t("Pro tip: Upload multiple PDFs then select them to compare concepts.", "نصيحة: ارفع عدة ملفات ثم حددها للمقارنة بين المفاهيم.")}
-            </div>
+            <div className="footNote">{t("Pro tip: Upload multiple PDFs then select them to compare concepts.", "نصيحة: ارفع عدة ملفات ثم حددها للمقارنة بين المفاهيم.")}</div>
           </footer>
         </section>
       </main>
@@ -1139,9 +1067,7 @@ function ChatBubble({ role, content, sources, dir, uiLang, pending, onOpenPrevie
   const copyText = async (txt) => {
     try {
       await navigator.clipboard.writeText(txt);
-    } catch {
-      // ignore
-    }
+    } catch {}
   };
 
   return (
@@ -1152,13 +1078,7 @@ function ChatBubble({ role, content, sources, dir, uiLang, pending, onOpenPrevie
 
           {!isUser && hasSources && !pending && (
             <button className="miniLink" onClick={() => setOpen((v) => !v)}>
-              {open
-                ? uiLang === "ar"
-                  ? "إخفاء المصادر"
-                  : "Hide sources"
-                : uiLang === "ar"
-                ? `عرض المصادر (${sources.length})`
-                : `Show sources (${sources.length})`}
+              {open ? (uiLang === "ar" ? "إخفاء المصادر" : "Hide sources") : uiLang === "ar" ? `عرض المصادر (${sources.length})` : `Show sources (${sources.length})`}
             </button>
           )}
         </div>
@@ -1174,10 +1094,7 @@ function ChatBubble({ role, content, sources, dir, uiLang, pending, onOpenPrevie
             lines.map((line, idx) => {
               const isBullet = line.trim().startsWith("•") || line.trim().startsWith("- ");
               const isHeading =
-                line.includes("الخلاصة") ||
-                line.includes("Summary") ||
-                line.includes("المصادر") ||
-                line.includes("Sources");
+                line.includes("الخلاصة") || line.includes("Summary") || line.includes("المصادر") || line.includes("Sources");
               return (
                 <div key={idx} className={`line ${isBullet ? "bullet" : ""} ${isHeading ? "heading" : ""}`}>
                   {renderWithCitations(line, messageLangDir)}

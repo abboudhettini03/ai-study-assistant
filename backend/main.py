@@ -1,83 +1,26 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends  # pyright: ignore[reportMissingImports]
-from fastapi.middleware.cors import CORSMiddleware  # type: ignore
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field  # type: ignore
+from pydantic import BaseModel, Field
 from io import BytesIO
-import PyPDF2  # type: ignore
+import PyPDF2
 import os
-import requests  # type: ignore
+import requests
 import uuid
-from typing import Dict, List, Any, Optional
-from datetime import datetime
-import asyncio
-from fastapi.responses import StreamingResponse
 import json
-from typing import Dict, Any
-
-
+import asyncio
 import re
 from collections import defaultdict
+from typing import Dict, List, Any, Optional
 
-from sklearn.feature_extraction.text import TfidfVectorizer  # type: ignore
-from sklearn.metrics.pairwise import cosine_similarity  # type: ignore
-
-# ====== SQLAlchemy (Postgres) ======
-from sqlalchemy import create_engine, Column, String, Integer, Text, LargeBinary, DateTime, ForeignKey
-from sqlalchemy.orm import sessionmaker, declarative_base, Session
-
-Base = declarative_base()
-
-
-def _normalize_db_url(url: str) -> str:
-    # Render sometimes provides postgres:// ; SQLAlchemy expects postgresql://
-    url = (url or "").strip()
-    if url.startswith("postgres://"):
-        return url.replace("postgres://", "postgresql://", 1)
-    return url
-
-
-DATABASE_URL = _normalize_db_url(os.environ.get("DATABASE_URL", ""))
-
-ENGINE = create_engine(DATABASE_URL, pool_pre_ping=True) if DATABASE_URL else None
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=ENGINE) if ENGINE else None
-
-
-class Document(Base):
-    __tablename__ = "documents"
-    doc_id = Column(String, primary_key=True, index=True)  # uuid as string
-    filename = Column(String, nullable=False)
-    num_pages = Column(Integer, nullable=False)
-    full_text = Column(Text, nullable=False)
-    pdf_bytes = Column(LargeBinary, nullable=False)
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-
-
-class Chunk(Base):
-    __tablename__ = "chunks"
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    doc_id = Column(String, ForeignKey("documents.doc_id", ondelete="CASCADE"), index=True, nullable=False)
-    page = Column(Integer, nullable=False)
-    text = Column(Text, nullable=False)
-
-
-def get_db():
-    """
-    DB dependency. If DATABASE_URL not set, endpoints that depend on DB will fail.
-    Upload/chat still work in-memory (non-persistent) if DB is missing.
-    """
-    if not SessionLocal:
-        raise HTTPException(status_code=500, detail="DATABASE_URL not configured.")
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
 
 app = FastAPI(
     title="StudySpark AI API",
     description="Backend for summarizing PDFs, generating questions, flashcards, and chatting with PDFs.",
-    version="3.1.0",
+    version="3.2.0",
     docs_url="/api-docs",
     redoc_url="/redoc",
 )
@@ -85,36 +28,24 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://ai-study-assistant-nu.vercel.app/",  # عدّل لو اسم مشروعك مختلف
         "http://localhost:3000",
+        "https://ai-study-assistant-nu.vercel.app",
     ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-# ====== CORS ======
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # لاحقاً خصصها
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ====== Stores (in-memory cache) ======
+# ====== Stores (in-memory only) ======
 DOC_STORE: Dict[str, str] = {}                     # doc_id -> full text
 PAGE_STORE: Dict[str, List[str]] = {}              # doc_id -> pages text
 CHUNK_STORE: Dict[str, List[Dict[str, Any]]] = {}  # doc_id -> [{"text":..., "page":...}]
 VEC_STORE: Dict[str, dict] = {}                    # doc_id -> {"vectorizer":..., "matrix":...}
-DOC_META: Dict[str, Dict[str, Any]] = {}           # doc_id -> {"filename":..., "num_pages":...}
+DOC_META: Dict[str, Dict[str, Any]] = {}           # doc_id -> {"filename":..., "num_pages":..., "client_id":...}
 PDF_STORE: Dict[str, bytes] = {}                   # doc_id -> original pdf bytes (for preview)
 
 
-# ====== Helpers ======
 def detect_lang(text: str) -> str:
-    """If Arabic chars exist => ar else en."""
     try:
         if any("\u0600" <= c <= "\u06FF" for c in (text or "")):
             return "ar"
@@ -123,7 +54,6 @@ def detect_lang(text: str) -> str:
     return "en"
 
 
-# ====== PDF Extraction (Page-aware) ======
 def extract_pages_from_pdf(file_bytes: bytes) -> List[str]:
     reader = PyPDF2.PdfReader(BytesIO(file_bytes))
     pages: List[str] = []
@@ -133,9 +63,6 @@ def extract_pages_from_pdf(file_bytes: bytes) -> List[str]:
 
 
 def chunk_pages(pages: List[str], chunk_size: int = 1200, overlap: int = 200) -> List[Dict[str, Any]]:
-    """
-    Chunk within each page (so each chunk has a reliable page number).
-    """
     chunks: List[Dict[str, Any]] = []
     for page_idx, page_text in enumerate(pages, start=1):
         text = (page_text or "").replace("\r", "")
@@ -179,7 +106,7 @@ def retrieve_chunks_for_doc(doc_id: str, query: str, k: int = 5) -> List[Dict[st
         score = float(sims[i_int])
         results.append(
             {
-                "id": f"S{rank}",  # temp label; re-labeled after merge
+                "id": f"S{rank}",
                 "doc_id": doc_id,
                 "score": score,
                 "text": chunk_obj.get("text", ""),
@@ -189,7 +116,7 @@ def retrieve_chunks_for_doc(doc_id: str, query: str, k: int = 5) -> List[Dict[st
     return results
 
 
-def merge_retrieval(doc_ids: List[str], query: str, top_k_total: int = 7, k_per_doc: int = 5) -> List[Dict[str, Any]]:
+def merge_retrieval(doc_ids: List[str], query: str, top_k_total: int = 12, k_per_doc: int = 5) -> List[Dict[str, Any]]:
     all_hits: List[Dict[str, Any]] = []
     for did in doc_ids:
         all_hits.extend(retrieve_chunks_for_doc(did, query, k=k_per_doc))
@@ -230,9 +157,6 @@ def call_llm(prompt: str) -> str:
 
 
 def translate_to_english_if_needed(text: str) -> str:
-    """
-    If Arabic => translate for retrieval only.
-    """
     try:
         if detect_lang(text) == "ar":
             prompt = f"""
@@ -251,7 +175,6 @@ Question:
         return text
 
 
-# ====== Request Models ======
 class SummaryRequest(BaseModel):
     text: str
     level: str = "university"
@@ -268,16 +191,19 @@ class FlashcardsRequest(BaseModel):
 
 
 class ChatRequest(BaseModel):
+    client_id: str = "public"
     doc_ids: List[str] = Field(default_factory=list)
     doc_id: Optional[str] = None
-
     message: str
     mode: str = "strict"  # "strict" | "simple" | "exam" | "chatty"
     lang: str = "auto"    # "auto" | "ar" | "en"
     history: List[Dict[str, str]] = Field(default_factory=list)
 
 
-# ====== Mode + Output formatting ======
+class ClearRequest(BaseModel):
+    client_id: str
+
+
 def build_mode_instructions(mode: str) -> str:
     mode = (mode or "strict").strip().lower()
 
@@ -286,9 +212,8 @@ def build_mode_instructions(mode: str) -> str:
             "MODE: CHATTY.\n"
             "- Be conversational and natural, like ChatGPT.\n"
             "- Ask ONE short clarifying question if needed.\n"
-            "- Prefer short paragraphs, not rigid bullet templates.\n"
+            "- Prefer short paragraphs.\n"
             "- Use the PDF context as primary; do not invent citations.\n"
-            "- If a detail is not supported by the PDF context, say it is general knowledge.\n"
         )
 
     if mode == "simple":
@@ -296,16 +221,17 @@ def build_mode_instructions(mode: str) -> str:
             "MODE: SIMPLE.\n"
             "- Explain in very simple terms.\n"
             "- Use short sentences.\n"
-            "- Give a tiny example if possible.\n"
             "- Use ONLY the PDF context.\n"
         )
+
     if mode == "exam":
         return (
             "MODE: EXAM.\n"
             "- Answer like a model exam answer.\n"
-            "- Use structured points (definition → key ideas → steps → notes).\n"
+            "- Use structured points.\n"
             "- Use ONLY the PDF context.\n"
         )
+
     return (
         "MODE: STRICT.\n"
         "- Answer ONLY from the provided PDF context.\n"
@@ -314,85 +240,76 @@ def build_mode_instructions(mode: str) -> str:
 
 
 def build_output_format(answer_lang: str) -> str:
-    """
-    Force stable Arabic formatting to avoid RTL/LTR mess.
-    Keep citations like [S1] in body; page/file in Sources section.
-    """
     if answer_lang == "ar":
         return (
             "OUTPUT FORMAT (Arabic):\n"
             "1) عنوان قصير: **الخلاصة**\n"
             "2) نقاط مرتبة (•) من 3 إلى 7 نقاط.\n"
-            "3) داخل النقاط: استخدم [S1] أو [S2] فقط (بدون كلمة Page داخل الجملة).\n"
+            "3) داخل النقاط: استخدم [S1] أو [S2] فقط.\n"
             "4) في النهاية: **المصادر**\n"
             "5) كل سطر:\n"
-            "   - S1 — صفحة 9 — Handout-2.pdf\n"
+            "   - S1 — صفحة 9 — File.pdf\n"
             "مهم: لا تضع رقم الصفحة داخل الجملة العربية.\n"
         )
     return (
         "OUTPUT FORMAT (English):\n"
         "1) Heading: **Summary**\n"
         "2) Bullet points (•) 3–7 bullets.\n"
-        "3) Cite as [S1], [S2] only (no 'Page' inside bullet).\n"
+        "3) Cite as [S1], [S2] only.\n"
         "4) End with **Sources**\n"
         "5) One source per line:\n"
-        "   - S1 — Page 9 — Handout-2.pdf\n"
+        "   - S1 — Page 9 — File.pdf\n"
     )
 
 
-# ====== Persistence loader ======
-def load_all_docs_from_db(db: Session) -> None:
-    # clear in-memory
-    DOC_STORE.clear()
-    PAGE_STORE.clear()
-    CHUNK_STORE.clear()
-    VEC_STORE.clear()
-    DOC_META.clear()
-    PDF_STORE.clear()
-
-    docs = db.query(Document).order_by(Document.created_at.desc()).all()
-    for d in docs:
-        doc_id = d.doc_id
-        DOC_STORE[doc_id] = d.full_text
-        DOC_META[doc_id] = {"filename": d.filename, "num_pages": d.num_pages}
-        PDF_STORE[doc_id] = bytes(d.pdf_bytes)
-
-        chunk_rows = (
-            db.query(Chunk)
-            .filter(Chunk.doc_id == doc_id)
-            .order_by(Chunk.id.asc())
-            .all()
-        )
-        chunks = [{"text": c.text, "page": int(c.page)} for c in chunk_rows]
-        CHUNK_STORE[doc_id] = chunks
-
-        if chunks:
-            build_tfidf_index(doc_id, chunks)
+def _tokenize_simple(s: str) -> List[str]:
+    s = (s or "").lower()
+    s = re.sub(r"[^a-z0-9\u0600-\u06ff\s]+", " ", s)
+    return [t for t in s.split() if len(t) >= 2]
 
 
-@app.on_event("startup")
-def on_startup():
-    if not ENGINE:
-        # No DB configured; app still runs in-memory (non-persistent)
-        print("INFO: DATABASE_URL not set; running in-memory (non-persistent).")
-        return
-
-    Base.metadata.create_all(bind=ENGINE)
-
-    db = SessionLocal()
-    try:
-        load_all_docs_from_db(db)
-        print(f"INFO: Loaded {len(DOC_META)} documents from DB.")
-    finally:
-        db.close()
+def _keyword_overlap_boost(query: str, chunk_text: str) -> float:
+    q = set(_tokenize_simple(query))
+    if not q:
+        return 0.0
+    c = set(_tokenize_simple(chunk_text))
+    hit = len(q.intersection(c))
+    return hit / max(6, len(q))
 
 
-# ====== Upload ======
+def rerank_hits(query: str, hits: List[Dict[str, Any]], alpha: float = 0.35) -> List[Dict[str, Any]]:
+    for h in hits:
+        boost = _keyword_overlap_boost(query, h.get("text", ""))
+        h["score2"] = float(h.get("score", 0.0)) + alpha * boost
+    hits.sort(key=lambda x: x.get("score2", x.get("score", 0.0)), reverse=True)
+    return hits
+
+
+def diversify_hits(hits: List[Dict[str, Any]], max_per_page: int = 1, max_per_doc: int = 3, k: int = 8) -> List[Dict[str, Any]]:
+    picked = []
+    per_doc = defaultdict(int)
+    per_page = defaultdict(int)  # key: (doc_id, page)
+
+    for h in hits:
+        doc_id = h.get("doc_id")
+        page = int(h.get("page") or 0)
+        if per_doc[doc_id] >= max_per_doc:
+            continue
+        if per_page[(doc_id, page)] >= max_per_page:
+            continue
+
+        picked.append(h)
+        per_doc[doc_id] += 1
+        per_page[(doc_id, page)] += 1
+        if len(picked) >= k:
+            break
+
+    return picked
+
+
+# ====== Upload (in-memory, isolated by client_id) ======
 @app.post("/upload")
-async def upload_pdf(file: UploadFile = File(...), db: Optional[Session] = Depends(get_db)):
-    """
-    Persistent upload (requires DATABASE_URL).
-    """
+async def upload_pdf(file: UploadFile = File(...), client_id: str = Form(...)):
     content = await file.read()
     pages = extract_pages_from_pdf(content)
     full_text = "\n\n".join([p for p in pages if p.strip()])
@@ -410,100 +327,71 @@ async def upload_pdf(file: UploadFile = File(...), db: Optional[Session] = Depen
 
     chunks = chunk_pages(pages, chunk_size=1200, overlap=200)
 
-    # --- persist to DB ---
-    # (db dependency will raise if DATABASE_URL missing)
-    doc_row = Document(
-        doc_id=doc_id,
-        filename=filename,
-        num_pages=num_pages,
-        full_text=full_text,
-        pdf_bytes=content,
-    )
-    db.add(doc_row)
-    db.flush()
-
-    for c in chunks:
-        db.add(Chunk(doc_id=doc_id, page=int(c.get("page", 0) or 0), text=c.get("text", "")))
-
-    db.commit()
-
-    # --- update in-memory cache ---
     PDF_STORE[doc_id] = content
     DOC_STORE[doc_id] = full_text
     PAGE_STORE[doc_id] = pages
-    DOC_META[doc_id] = {"filename": filename, "num_pages": num_pages}
+    DOC_META[doc_id] = {"filename": filename, "num_pages": num_pages, "client_id": client_id}
     CHUNK_STORE[doc_id] = chunks
     build_tfidf_index(doc_id, chunks)
 
     return {"doc_id": doc_id, "text": full_text, "filename": filename, "num_pages": num_pages}
 
 
-# ====== PDF Preview endpoint ======
+# ====== PDF Preview (must match client_id) ======
 @app.get("/pdf/{doc_id}")
-async def get_pdf(doc_id: str, db: Session = Depends(get_db)):
-    pdf = PDF_STORE.get(doc_id)
-    meta = DOC_META.get(doc_id, {})
+async def get_pdf(doc_id: str, client_id: str):
+    meta = DOC_META.get(doc_id)
+    if not meta or meta.get("client_id") != client_id:
+        raise HTTPException(status_code=404, detail="PDF not found for this client.")
 
+    pdf = PDF_STORE.get(doc_id)
     if not pdf:
-        d = db.query(Document).filter(Document.doc_id == doc_id).first()
-        if not d:
-            raise HTTPException(status_code=404, detail="PDF not found. Re-upload the PDF.")
-        pdf = bytes(d.pdf_bytes)
-        meta = {"filename": d.filename, "num_pages": d.num_pages}
-        PDF_STORE[doc_id] = pdf
-        DOC_META[doc_id] = {"filename": d.filename, "num_pages": d.num_pages}
+        raise HTTPException(status_code=404, detail="PDF not found. Re-upload the PDF.")
 
     filename = meta.get("filename", "document.pdf")
-
     return StreamingResponse(
         BytesIO(pdf),
         media_type="application/pdf",
-        headers={
-            "Content-Disposition": f'inline; filename="{filename}"',
-            "Cache-Control": "no-store",
-        },
+        headers={"Content-Disposition": f'inline; filename="{filename}"', "Cache-Control": "no-store"},
     )
 
 
 # ====== Docs API (Library) ======
 @app.get("/docs")
-async def list_docs(db: Session = Depends(get_db)):
-    docs = db.query(Document).order_by(Document.created_at.desc()).all()
-    return [
-        {
-            "doc_id": d.doc_id,
-            "filename": d.filename,
-            "num_pages": d.num_pages,
-            "created_at": d.created_at.isoformat() if d.created_at else None,
-        }
-        for d in docs
-    ]
+async def list_docs(client_id: str):
+    items = []
+    for doc_id, meta in DOC_META.items():
+        if meta.get("client_id") == client_id:
+            items.append(
+                {
+                    "doc_id": doc_id,
+                    "filename": meta.get("filename", ""),
+                    "num_pages": meta.get("num_pages", 0),
+                }
+            )
+    return items
 
 
 @app.get("/docs/{doc_id}")
-async def get_doc(doc_id: str, db: Session = Depends(get_db)):
-    d = db.query(Document).filter(Document.doc_id == doc_id).first()
-    if not d:
-        raise HTTPException(status_code=404, detail="Document not found.")
+async def get_doc(doc_id: str, client_id: str):
+    meta = DOC_META.get(doc_id)
+    if not meta or meta.get("client_id") != client_id:
+        raise HTTPException(status_code=404, detail="Document not found for this client.")
+
     return {
-        "doc_id": d.doc_id,
-        "filename": d.filename,
-        "num_pages": d.num_pages,
-        "text": d.full_text,
+        "doc_id": doc_id,
+        "filename": meta.get("filename", ""),
+        "num_pages": meta.get("num_pages", 0),
+        "text": DOC_STORE.get(doc_id, ""),
     }
 
 
 @app.delete("/docs/{doc_id}")
-async def delete_doc(doc_id: str, db: Session = Depends(get_db)):
-    d = db.query(Document).filter(Document.doc_id == doc_id).first()
-    if not d:
-        raise HTTPException(status_code=404, detail="Document not found.")
+async def delete_doc(doc_id: str, client_id: str):
+    meta = DOC_META.get(doc_id)
+    if not meta or meta.get("client_id") != client_id:
+        raise HTTPException(status_code=404, detail="Document not found for this client.")
 
-    db.query(Chunk).filter(Chunk.doc_id == doc_id).delete()
-    db.query(Document).filter(Document.doc_id == doc_id).delete()
-    db.commit()
-
-    # remove from memory if present
     PDF_STORE.pop(doc_id, None)
     DOC_STORE.pop(doc_id, None)
     PAGE_STORE.pop(doc_id, None)
@@ -512,6 +400,20 @@ async def delete_doc(doc_id: str, db: Session = Depends(get_db)):
     DOC_META.pop(doc_id, None)
 
     return {"ok": True, "doc_id": doc_id}
+
+
+# ====== Clear all docs for a client (used when leaving the site) ======
+@app.post("/clear")
+async def clear_client(req: ClearRequest):
+    to_delete = [doc_id for doc_id, meta in DOC_META.items() if meta.get("client_id") == req.client_id]
+    for doc_id in to_delete:
+        PDF_STORE.pop(doc_id, None)
+        DOC_STORE.pop(doc_id, None)
+        PAGE_STORE.pop(doc_id, None)
+        CHUNK_STORE.pop(doc_id, None)
+        VEC_STORE.pop(doc_id, None)
+        DOC_META.pop(doc_id, None)
+    return {"ok": True, "deleted": len(to_delete)}
 
 
 # ====== Summarize / Questions / Flashcards ======
@@ -563,57 +465,18 @@ Text:
     return {"flashcards": flashcards}
 
 
-
-def _tokenize_simple(s: str) -> list[str]:
-    s = (s or "").lower()
-    s = re.sub(r"[^a-z0-9\u0600-\u06ff\s]+", " ", s)
-    toks = [t for t in s.split() if len(t) >= 2]
-    return toks
-
-def _keyword_overlap_boost(query: str, chunk_text: str) -> float:
-    q = set(_tokenize_simple(query))
-    if not q:
-        return 0.0
-    c = set(_tokenize_simple(chunk_text))
-    hit = len(q.intersection(c))
-    return hit / max(6, len(q))  # small normalized boost
-
-def rerank_hits(query: str, hits: list[dict], alpha: float = 0.25) -> list[dict]:
-    # hits: [{doc_id, idx, score, page, text, ...}]
-    for h in hits:
-        boost = _keyword_overlap_boost(query, h.get("text", ""))
-        h["score2"] = float(h.get("score", 0.0)) + alpha * boost
-    hits.sort(key=lambda x: x.get("score2", x.get("score", 0.0)), reverse=True)
-    return hits
-
-def diversify_hits(hits: list[dict], max_per_page: int = 1, max_per_doc: int = 4, k: int = 8) -> list[dict]:
-    picked = []
-    per_doc = defaultdict(int)
-    per_page = defaultdict(int)  # key: (doc_id, page)
-
-    for h in hits:
-        doc_id = h.get("doc_id")
-        page = int(h.get("page") or 0)
-        if per_doc[doc_id] >= max_per_doc:
-            continue
-        if per_page[(doc_id, page)] >= max_per_page:
-            continue
-
-        picked.append(h)
-        per_doc[doc_id] += 1
-        per_page[(doc_id, page)] += 1
-        if len(picked) >= k:
-            break
-
-    return picked
-
-
+# ====== Chat logic (isolated by client_id) ======
 async def run_chat_logic(req: ChatRequest) -> Dict[str, Any]:
     doc_ids = req.doc_ids if req.doc_ids else ([req.doc_id] if req.doc_id else [])
-    doc_ids = [d for d in doc_ids if d and d in DOC_STORE]
+
+    # only docs belonging to this client
+    doc_ids = [
+        d for d in doc_ids
+        if d and d in DOC_STORE and DOC_META.get(d, {}).get("client_id") == req.client_id
+    ]
 
     if not doc_ids:
-        return {"answer": "No valid doc_id(s). Upload a PDF first.", "sources": [], "answer_lang": "en"}
+        return {"answer": "No valid doc_id(s) for this client. Upload a PDF first.", "sources": [], "answer_lang": "en"}
 
     user_lang = detect_lang(req.message)
     answer_lang = (req.lang or "auto").strip().lower()
@@ -631,16 +494,13 @@ async def run_chat_logic(req: ChatRequest) -> Dict[str, Any]:
     for i, item in enumerate(hits, start=1):
         item["id"] = f"S{i}"
 
-    retrieved = hits
-
-    if (not retrieved) or (retrieved[0].get("score", 0.0) < 0.05):
+    if (not hits) or (hits[0].get("score", 0.0) < 0.05):
         if answer_lang == "ar":
             return {"answer": "لم أجد محتوى مناسبًا داخل الـ PDF(s) المحددة للإجابة على سؤالك.", "sources": [], "answer_lang": "ar"}
         return {"answer": "I couldn't find relevant content in the selected PDF(s).", "sources": [], "answer_lang": "en"}
 
-    # ====== build context (نفس كودك القديم) ======
     numbered_context = []
-    for item in retrieved:
+    for item in hits:
         meta = DOC_META.get(item["doc_id"], {})
         filename = meta.get("filename", item["doc_id"])
         numbered_context.append(
@@ -648,7 +508,6 @@ async def run_chat_logic(req: ChatRequest) -> Dict[str, Any]:
         )
     context = "\n\n---\n\n".join(numbered_context)
 
-    # ====== history (نفس كودك القديم) ======
     history_text = ""
     if req.history:
         last = req.history[-16:]
@@ -661,15 +520,12 @@ async def run_chat_logic(req: ChatRequest) -> Dict[str, Any]:
         history_text = "\n".join(lines)
 
     mode_instructions = build_mode_instructions(req.mode)
-
     use_rigid_format = (req.mode or "strict").strip().lower() in ("strict", "exam", "simple")
     out_fmt = build_output_format(answer_lang) if use_rigid_format else (
         "OUTPUT (Chatty):\n"
         "- Write naturally in short paragraphs.\n"
         "- Use inline citations like [S1] when referencing the PDF.\n"
-        "- If you used any sources, end with a short **Sources** list:\n"
-        "  - S1 — Page 9 — FileName.pdf\n"
-        "- Important for Arabic: do NOT put page numbers inside Arabic sentences.\n"
+        "- If you used any sources, end with a short **Sources** list.\n"
     )
 
     lang_rule = "Answer in Arabic only." if answer_lang == "ar" else "Answer in English only."
@@ -682,9 +538,7 @@ You are a helpful AI assistant.
 
 Rules:
 - Use ONLY the PDF context below.
-- If the answer isn't in the context, say so clearly.
 - Do NOT invent sources.
-- Keep it clean and well-structured.
 
 Conversation (optional):
 {history_text}
@@ -698,13 +552,10 @@ User Question:
 {lang_rule}
 """
 
-    # ✅ مهم: call_llm عندك غالبًا async
     answer = call_llm(prompt)
 
-
-    # ====== sources (نفس كودك القديم) ======
     sources = []
-    for item in retrieved:
+    for item in hits:
         meta = DOC_META.get(item["doc_id"], {})
         sources.append(
             {
@@ -720,27 +571,23 @@ User Question:
     return {"answer": answer, "sources": sources, "answer_lang": answer_lang}
 
 
-@app.post("/chat")
-async def chat_with_pdf(req: ChatRequest):
-    return await run_chat_logic(req)
-
-
 @app.post("/chat-stream")
 async def chat_stream(req: ChatRequest):
     result = await run_chat_logic(req)
-
     answer = result.get("answer", "")
     sources = result.get("sources", [])
     answer_lang = result.get("answer_lang", "en")
 
-    async def gen():   # 🔴 مهم: async def
-        yield f"event: meta\ndata: {json.dumps({'answer_lang': answer_lang})}\n\n"
+    # slower typing
+    chunk_size = 18
+    delay_seconds = 0.03
 
-        chunk_size = 24
+    async def gen():
+        yield f"event: meta\ndata: {json.dumps({'answer_lang': answer_lang})}\n\n"
         for i in range(0, len(answer), chunk_size):
-            part = answer[i:i+chunk_size]
+            part = answer[i:i + chunk_size]
             yield f"event: delta\ndata: {json.dumps({'text': part})}\n\n"
-            await asyncio.sleep(0.01)   # ✅ هنا التعديل
+            await asyncio.sleep(delay_seconds)
 
         yield f"event: sources\ndata: {json.dumps({'sources': sources})}\n\n"
         yield "event: done\ndata: {}\n\n"
@@ -754,8 +601,6 @@ async def chat_stream(req: ChatRequest):
             "X-Accel-Buffering": "no",
         },
     )
-
-
 
 
 @app.get("/")

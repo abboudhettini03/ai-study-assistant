@@ -5,5 +5,4 @@ PyPDF2
 requests
 scikit-learn
 pydantic
-SQLAlchemy>=2.0
-psycopg2-binary
+
