@@ -27,7 +27,7 @@ function clamp(n, min, max) {
  * Render text with inline citation badges:
  * Converts [S1] / (S1) into a styled LTR badge span.
  */
-function renderWithCitations(text, dir) {
+function renderWithCitations(text, dir = "ltr", onCitation) {
   if (!text) return null;
   const parts = [];
   const re = /(\[S\d+\]|\(S\d+\))/g;
@@ -39,14 +39,36 @@ function renderWithCitations(text, dir) {
     if (before) parts.push(before);
 
     const raw = m[0];
-    const id = raw.replace("[", "").replace("]", "").replace("(", "").replace(")", "");
+    const id = raw
+      .replace("[", "")
+      .replace("]", "")
+      .replace("(", "")
+      .replace(")", "");
+
     parts.push(
-      <span key={`${m.index}-${id}`} className="citeBadge" dir="ltr" title="Citation">
+      <span
+        key={`${m.index}-${id}`}
+        className={`citeBadge ${onCitation ? "clickable" : ""}`}
+        dir="ltr"
+        title="Citation"
+        role={onCitation ? "button" : undefined}
+        tabIndex={onCitation ? 0 : undefined}
+        onClick={onCitation ? () => onCitation(id) : undefined}
+        onKeyDown={
+          onCitation
+            ? (e) => {
+                if (e.key === "Enter" || e.key === " ") onCitation(id);
+              }
+            : undefined
+        }
+      >
         {id}
       </span>
     );
+
     last = m.index + raw.length;
   }
+
   const rest = text.slice(last);
   if (rest) parts.push(rest);
 
@@ -99,10 +121,42 @@ function App() {
     page: 1,
   });
 
+  // ====== Power UI
+  const [focusMode, setFocusMode] = useState(false); // hides side/right panels
+  const [commandOpen, setCommandOpen] = useState(false);
+  const [commandQuery, setCommandQuery] = useState("");
+  const [activeSource, setActiveSource] = useState(null); // {id, doc_id, page, filename, excerpt}
+  const [pinned, setPinned] = useState([]); // [{id, content, when}]
+  const [notes, setNotes] = useState([]); // [{id, title, body, when}]
+
+  // ====== PDF Library filters (local only)
+  const [docSearch, setDocSearch] = useState("");
+  const [docSort, setDocSort] = useState("newest"); // newest | name
+
   const selectedPdfs = useMemo(
     () => pdfs.filter((p) => selectedDocIds.includes(p.doc_id)),
     [pdfs, selectedDocIds]
   );
+
+  const filteredPdfs = useMemo(() => {
+    const q = (docSearch || "").trim().toLowerCase();
+    let list = [...pdfs];
+
+    if (q) {
+      list = list.filter(
+        (p) =>
+          (p.filename || "").toLowerCase().includes(q) ||
+          (p.doc_id || "").toLowerCase().includes(q)
+      );
+    }
+
+    if (docSort === "name") {
+      list.sort((a, b) => (a.filename || "").localeCompare(b.filename || ""));
+    }
+    // newest: keep server order
+
+    return list;
+  }, [pdfs, docSearch, docSort]);
 
   // ====== Toast helpers
   const pushToast = (type, message) => {
@@ -121,12 +175,16 @@ function App() {
     );
     const data = await res.json();
     if (!res.ok) throw new Error(data?.detail || "Failed to load docs.");
-    const items = (data || []).map((d) => ({
+
+    const docsArr = Array.isArray(data) ? data : data?.docs || [];
+
+    const items = docsArr.map((d) => ({
       doc_id: d.doc_id,
       filename: d.filename,
       num_pages: d.num_pages,
-      text: "", // lazy-load when selected
+      text: "", // lazy-load
     }));
+
     setPdfs(items);
   };
 
@@ -135,12 +193,33 @@ function App() {
     const load = async () => {
       try {
         await refreshDocs();
-      } catch (e) {
-        // optional toast
+      } catch {
+        // silent
       }
     };
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Command palette: Ctrl+K (or Cmd+K) + Escape
+  useEffect(() => {
+    const onKeyDown = (e) => {
+      const isMac = navigator.platform?.toLowerCase().includes("mac");
+      const mod = isMac ? e.metaKey : e.ctrlKey;
+
+      if (mod && (e.key === "k" || e.key === "K")) {
+        e.preventDefault();
+        setCommandOpen(true);
+        setCommandQuery("");
+        return;
+      }
+      if (e.key === "Escape") {
+        setCommandOpen(false);
+      }
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
 
   useEffect(() => {
@@ -156,6 +235,27 @@ function App() {
       .join("\n\n---\n\n");
     setText(combined);
   }, [selectedPdfs]);
+
+  const openSource = (sourceId) => {
+    const lastWithSources = [...chatMessages]
+      .reverse()
+      .find((m) => m.role === "assistant" && (m.sources || []).length);
+
+    const src = (lastWithSources?.sources || []).find((s) => s.id === sourceId);
+    if (src) setActiveSource(src);
+  };
+
+  const pinMessage = (content) => {
+    const id = `${Date.now()}-${Math.random()}`;
+    setPinned((p) => [{ id, content, when: Date.now() }, ...p].slice(0, 20));
+    pushToast("info", t("Pinned to workspace", "تم تثبيت الرسالة"));
+  };
+
+  const addNoteFrom = (title, body) => {
+    const id = `${Date.now()}-${Math.random()}`;
+    setNotes((n) => [{ id, title, body, when: Date.now() }, ...n].slice(0, 50));
+    pushToast("success", t("Saved to notes", "تم الحفظ في الملاحظات"));
+  };
 
   const isLoading = (k) => loadingAction === k;
 
@@ -232,9 +332,12 @@ function App() {
     try {
       const form = new FormData();
       form.append("file", file);
-      form.append("client_id", CLIENT_ID); // ✅ مهم
+      form.append("client_id", CLIENT_ID);
 
-      const res = await fetch(`${API_BASE}/upload`, { method: "POST", body: form });
+      const res = await fetch(`${API_BASE}/upload`, {
+        method: "POST",
+        body: form,
+      });
       const data = await res.json();
 
       if (!res.ok) throw new Error(data?.detail || "Upload failed.");
@@ -242,7 +345,9 @@ function App() {
 
       await refreshDocs();
 
-      setSelectedDocIds((prev) => (prev.includes(data.doc_id) ? prev : [data.doc_id, ...prev]));
+      setSelectedDocIds((prev) =>
+        prev.includes(data.doc_id) ? prev : [data.doc_id, ...prev]
+      );
 
       setFile(null);
       setChatMessages([]);
@@ -380,8 +485,7 @@ function App() {
   };
 
   const buildHistoryPayload = (msgs) => {
-    const tail = msgs.slice(-16).map((m) => ({ role: m.role, content: m.content }));
-    return tail;
+    return msgs.slice(-16).map((m) => ({ role: m.role, content: m.content }));
   };
 
   const openPreview = (source) => {
@@ -442,7 +546,6 @@ function App() {
         const txt = await res.text();
         throw new Error((txt || "").slice(0, 200) || "Chat failed.");
       }
-
       if (!res.body) throw new Error("Streaming not supported by the browser.");
 
       const reader = res.body.getReader();
@@ -458,7 +561,11 @@ function App() {
           const next = [...prev];
           for (let i = next.length - 1; i >= 0; i--) {
             if (next[i]?.pending) {
-              next[i] = { ...next[i], content: partialText, lang: langGuess || next[i].lang };
+              next[i] = {
+                ...next[i],
+                content: partialText,
+                lang: langGuess || next[i].lang,
+              };
               break;
             }
           }
@@ -471,6 +578,7 @@ function App() {
       const finalize = () => {
         if (finalized) return;
         finalized = true;
+
         const botMsg = {
           role: "assistant",
           content: accumulated,
@@ -529,7 +637,6 @@ function App() {
 
         if (eventName === "done") {
           finalize();
-          return;
         }
       };
 
@@ -589,14 +696,12 @@ function App() {
       const url = `${API_BASE}/clear`;
       const payload = JSON.stringify({ client_id: CLIENT_ID });
 
-      // try sendBeacon first
       if (navigator.sendBeacon) {
         const blob = new Blob([payload], { type: "application/json" });
         navigator.sendBeacon(url, blob);
         return;
       }
 
-      // fallback fetch keepalive
       fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -629,7 +734,7 @@ function App() {
             <div className="toastMsg">{x.message}</div>
             <button
               className="toastX"
-              onClick={() => setToasts((p) => p.filter((t) => t.id !== x.id))}
+              onClick={() => setToasts((p) => p.filter((t2) => t2.id !== x.id))}
               aria-label="Close"
             >
               ✕
@@ -640,7 +745,10 @@ function App() {
 
       {/* PDF Preview Modal */}
       {preview.open && (
-        <div className="modalOverlay" onMouseDown={() => setPreview((p) => ({ ...p, open: false }))}>
+        <div
+          className="modalOverlay"
+          onMouseDown={() => setPreview((p) => ({ ...p, open: false }))}
+        >
           <div className="modalCard" onMouseDown={(e) => e.stopPropagation()}>
             <div className="modalTop">
               <div className="modalTitle">
@@ -660,7 +768,10 @@ function App() {
                 >
                   {t("Open in new tab", "فتح في تبويب")}
                 </a>
-                <button className="tinyBtn" onClick={() => setPreview((p) => ({ ...p, open: false }))}>
+                <button
+                  className="tinyBtn"
+                  onClick={() => setPreview((p) => ({ ...p, open: false }))}
+                >
                   {t("Close", "إغلاق")}
                 </button>
               </div>
@@ -683,66 +794,201 @@ function App() {
         <div className="brand">
           <div className="logoDot" />
           <div>
-            <div className="brandTitle">{uiLang === "ar" ? brand.name_ar : brand.name}</div>
+            <div className="brandTitle">
+              {uiLang === "ar" ? brand.name_ar : brand.name}
+            </div>
             <div className="brandSub">{brand.tag}</div>
           </div>
         </div>
 
         <div className="topActions">
           <div className="pillToggle">
-            <button className={`pill ${uiLang === "en" ? "active" : ""}`} onClick={() => setUiLang("en")}>
+            <button
+              className={`pill ${uiLang === "en" ? "active" : ""}`}
+              onClick={() => setUiLang("en")}
+            >
               EN
             </button>
-            <button className={`pill ${uiLang === "ar" ? "active" : ""}`} onClick={() => setUiLang("ar")}>
+            <button
+              className={`pill ${uiLang === "ar" ? "active" : ""}`}
+              onClick={() => setUiLang("ar")}
+            >
               AR
+            </button>
+          </div>
+
+          <div className="topBtns">
+            <button
+              className="btn ghost"
+              onClick={() => {
+                setCommandOpen(true);
+                setCommandQuery("");
+              }}
+              title={t("Command palette (Ctrl+K)", "لوحة الأوامر (Ctrl+K)")}
+            >
+              ⌘K
+            </button>
+            <button
+              className={`btn ghost ${focusMode ? "on" : ""}`}
+              onClick={() => setFocusMode((v) => !v)}
+              title={t("Focus mode", "وضع التركيز")}
+            >
+              {focusMode ? t("Focus: ON", "التركيز: تشغيل") : t("Focus", "تركيز")}
             </button>
           </div>
 
           <div className="tinyMeta">
             <div className="metaLine">
-              {t("Backend:", "الخلفية:")} <span>{t("FastAPI + Groq", "FastAPI + Groq")}</span>
+              {t("Backend:", "الخلفية:")}{" "}
+              <span>{t("FastAPI + Groq", "FastAPI + Groq")}</span>
             </div>
             <div className="metaLine">
-              {t("Features:", "المميزات:")} <span>{t("Sources + Preview", "مصادر + معاينة")}</span>
+              {t("Features:", "المميزات:")}{" "}
+              <span>{t("Sources + Preview", "مصادر + معاينة")}</span>
             </div>
           </div>
         </div>
       </header>
 
+      {/* Command Palette — ALWAYS available (not inside showLanding) */}
+      {commandOpen && (
+        <div className="modalOverlay" onMouseDown={() => setCommandOpen(false)}>
+          <div
+            className="cmdModal"
+            onMouseDown={(e) => e.stopPropagation()}
+            dir={uiDir}
+          >
+            <div className="cmdTop">
+              <div className="cmdTitle">{t("Command Palette", "لوحة الأوامر")}</div>
+              <button
+                className="toastX"
+                onClick={() => setCommandOpen(false)}
+                aria-label="Close"
+              >
+                ✕
+              </button>
+            </div>
+
+            <input
+              className="cmdInput"
+              autoFocus
+              value={commandQuery}
+              onChange={(e) => setCommandQuery(e.target.value)}
+              placeholder={t(
+                "Type an action… (e.g., summary, flashcards, focus)",
+                "اكتب أمرًا… (مثل: ملخص، بطاقات، تركيز)"
+              )}
+            />
+
+            <div className="cmdList">
+              {[
+                {
+                  key: "upload",
+                  label: t("Upload PDF", "رفع PDF"),
+                  run: () =>
+                    document
+                      .querySelector('input[type="file"][accept="application/pdf"]')
+                      ?.click?.(),
+                },
+                { key: "chat", label: t("Go to Chat", "اذهب للدردشة"), run: () => setTab("chat") },
+                { key: "summary", label: t("Go to Summary", "اذهب للملخص"), run: () => setTab("summary") },
+                { key: "questions", label: t("Go to Questions", "اذهب للأسئلة"), run: () => setTab("questions") },
+                { key: "flashcards", label: t("Go to Flashcards", "اذهب للبطاقات"), run: () => setTab("flashcards") },
+                {
+                  key: "focus",
+                  label: focusMode
+                    ? t("Disable Focus mode", "إيقاف وضع التركيز")
+                    : t("Enable Focus mode", "تشغيل وضع التركيز"),
+                  run: () => setFocusMode((v) => !v),
+                },
+                { key: "clearChat", label: t("Clear chat", "مسح الدردشة"), run: () => handleClearChat() },
+                { key: "clearPdfs", label: t("Clear PDFs (this client)", "مسح ملفات هذا العميل"), run: () => handleClearPdfs() },
+              ]
+                .filter((a) =>
+                  a.label.toLowerCase().includes((commandQuery || "").toLowerCase())
+                )
+                .slice(0, 8)
+                .map((a) => (
+                  <button
+                    key={a.key}
+                    className="cmdItem"
+                    onClick={() => {
+                      setCommandOpen(false);
+                      a.run();
+                    }}
+                  >
+                    {a.label}
+                  </button>
+                ))}
+            </div>
+
+            <div className="cmdHint">{t("Tip: Press Esc to close.", "نصيحة: اضغط Esc للإغلاق.")}</div>
+          </div>
+        </div>
+      )}
+
+      {/* Landing — only when there are no PDFs */}
       {showLanding && (
         <section className="landing">
           <div className="landingHero">
             <div className="heroKicker">{t("Premium Study Experience", "تجربة مذاكرة فخمة")}</div>
             <div className="heroTitle">
-              {t("Turn PDFs into clean answers, summaries, and exam material.", "حوّل ملفات PDF إلى إجابات مرتبة وملخص وأسئلة امتحانية.")}
+              {t(
+                "Turn PDFs into clean answers, summaries, and exam material.",
+                "حوّل ملفات PDF إلى إجابات مرتبة وملخص وأسئلة امتحانية."
+              )}
             </div>
             <div className="heroSub">
-              {t("Upload multiple PDFs, ask in Arabic or English, and cite sources with page numbers — instantly.", "ارفع عدة ملفات، اسأل بالعربي أو الإنجليزي، واحصل على استشهادات مع أرقام الصفحات فورًا.")}
+              {t(
+                "Upload multiple PDFs, ask in Arabic or English, and cite sources with page numbers — instantly.",
+                "ارفع عدة ملفات، اسأل بالعربي أو الإنجليزي، واحصل على استشهادات مع أرقام الصفحات فورًا."
+              )}
             </div>
 
             <div className="heroCTA">
               <button
                 className="btn primary bigBtn"
                 onClick={() =>
-                  pushToast("info", t("Start by uploading a PDF from the left panel.", "ابدأ برفع PDF من اللوحة اليسرى."))
+                  pushToast(
+                    "info",
+                    t("Start by uploading a PDF from the left panel.", "ابدأ برفع PDF من اللوحة اليسرى.")
+                  )
                 }
               >
                 {t("Get Started", "ابدأ الآن")}
               </button>
-              <div className="heroMiniNote">{t("No accounts yet — just pure productivity.", "بدون حسابات حالياً — إنتاجية مباشرة.")}</div>
+              <div className="heroMiniNote">
+                {t("No accounts yet — just pure productivity.", "بدون حسابات حالياً — إنتاجية مباشرة.")}
+              </div>
             </div>
           </div>
 
           <div className="featureGrid">
-            <FeatureCard title={t("Chat with sources", "دردشة مع مصادر")} sub={t("Citations like [S1] + page numbers.", "استشهادات [S1] + أرقام صفحات.")} icon="📌" />
-            <FeatureCard title={t("Multi-PDF", "عدة ملفات")} sub={t("Select multiple PDFs and compare concepts.", "حدد عدة ملفات وقارن المفاهيم.")} icon="📚" />
-            <FeatureCard title={t("Preview instantly", "معاينة فورية")} sub={t("Open the PDF at the cited page.", "افتح الـ PDF على صفحة المصدر.")} icon="🔍" />
-            <FeatureCard title={t("Study modes", "أوضاع مذاكرة")} sub={t("Strict / Simple / Exam-ready / Chatty.", "صارم / مبسط / امتحاني / محادثة.")} icon="⚡" />
+            <FeatureCard
+              title={t("Chat with sources", "دردشة مع مصادر")}
+              sub={t("Citations like [S1] + page numbers.", "استشهادات [S1] + أرقام صفحات.")}
+              icon="📌"
+            />
+            <FeatureCard
+              title={t("Multi-PDF", "عدة ملفات")}
+              sub={t("Select multiple PDFs and compare concepts.", "حدد عدة ملفات وقارن المفاهيم.")}
+              icon="📚"
+            />
+            <FeatureCard
+              title={t("Preview instantly", "معاينة فورية")}
+              sub={t("Open the PDF at the cited page.", "افتح الـ PDF على صفحة المصدر.")}
+              icon="🔍"
+            />
+            <FeatureCard
+              title={t("Study modes", "أوضاع مذاكرة")}
+              sub={t("Strict / Simple / Exam-ready / Chatty.", "صارم / مبسط / امتحاني / محادثة.")}
+              icon="⚡"
+            />
           </div>
         </section>
       )}
 
-      <main className="layout">
+      <main className={`layout ${focusMode ? "focus" : ""}`}>
         {/* Sidebar */}
         <aside className="side">
           <section className="card">
@@ -757,9 +1003,26 @@ function App() {
                 <span>{file ? file.name : t("Choose PDF", "اختر PDF")}</span>
               </label>
 
-              <button className={`btn primary ${isLoading("upload") ? "loading" : ""}`} onClick={handleUpload} disabled={isLoading("upload")}>
+              <button
+                className={`btn primary ${isLoading("upload") ? "loading" : ""}`}
+                onClick={handleUpload}
+                disabled={isLoading("upload")}
+              >
                 {isLoading("upload") ? t("Uploading…", "جاري الرفع…") : t("Upload & Extract", "رفع واستخراج")}
               </button>
+            </div>
+
+            <div className="libControls">
+              <input
+                className="searchInput"
+                value={docSearch}
+                onChange={(e) => setDocSearch(e.target.value)}
+                placeholder={t("Search PDFs…", "ابحث في الملفات…")}
+              />
+              <select className="select" value={docSort} onChange={(e) => setDocSort(e.target.value)}>
+                <option value="newest">{t("Sort: Newest", "ترتيب: الأحدث")}</option>
+                <option value="name">{t("Sort: Name", "ترتيب: الاسم")}</option>
+              </select>
             </div>
 
             <div className="pdfListWrap">
@@ -778,10 +1041,15 @@ function App() {
               ) : (
                 !isLoading("upload") && (
                   <div className="pdfList">
-                    {pdfs.map((p) => {
+                    {filteredPdfs.map((p) => {
                       const checked = selectedDocIds.includes(p.doc_id);
                       return (
-                        <button key={p.doc_id} className={`pdfItem ${checked ? "checked" : ""}`} onClick={() => toggleSelect(p.doc_id)} title={p.filename}>
+                        <button
+                          key={p.doc_id}
+                          className={`pdfItem ${checked ? "checked" : ""}`}
+                          onClick={() => toggleSelect(p.doc_id)}
+                          title={p.filename}
+                        >
                           <div className="checkBox">
                             <div className={`checkDot ${checked ? "on" : ""}`} />
                           </div>
@@ -789,8 +1057,9 @@ function App() {
                           <div className="pdfMeta">
                             <div className="pdfName">{p.filename}</div>
                             <div className="pdfSub">
-                              {t("Pages:", "الصفحات:")} <span>{p.num_pages ?? "—"}</span> <span className="sep">•</span>{" "}
-                              <span className="mono">{p.doc_id.slice(0, 8)}</span>
+                              {t("Pages:", "الصفحات:")} <span>{p.num_pages ?? "—"}</span>{" "}
+                              <span className="sep">•</span>{" "}
+                              <span className="mono">{(p.doc_id || "").slice(0, 8)}</span>
                             </div>
                           </div>
 
@@ -840,12 +1109,24 @@ function App() {
 
               <div className="field">
                 <div className="label">{t("# Questions", "عدد الأسئلة")}</div>
-                <input type="number" min={1} max={20} value={numQuestions} onChange={(e) => setNumQuestions(clamp(Number(e.target.value || 5), 1, 20))} />
+                <input
+                  type="number"
+                  min={1}
+                  max={20}
+                  value={numQuestions}
+                  onChange={(e) => setNumQuestions(clamp(Number(e.target.value || 5), 1, 20))}
+                />
               </div>
 
               <div className="field">
                 <div className="label">{t("# Flashcards", "عدد البطاقات")}</div>
-                <input type="number" min={1} max={30} value={numCards} onChange={(e) => setNumCards(clamp(Number(e.target.value || 6), 1, 30))} />
+                <input
+                  type="number"
+                  min={1}
+                  max={30}
+                  value={numCards}
+                  onChange={(e) => setNumCards(clamp(Number(e.target.value || 6), 1, 30))}
+                />
               </div>
 
               <div className="field">
@@ -860,15 +1141,27 @@ function App() {
             </div>
 
             <div className="sideActions row">
-              <button className={`btn accent ${isLoading("summary") ? "loading" : ""}`} onClick={handleSummarize} disabled={isLoading("summary")}>
+              <button
+                className={`btn accent ${isLoading("summary") ? "loading" : ""}`}
+                onClick={handleSummarize}
+                disabled={isLoading("summary")}
+              >
                 {isLoading("summary") ? t("Working…", "جاري…") : t("Generate Summary", "إنشاء ملخص")}
               </button>
 
-              <button className={`btn violet ${isLoading("questions") ? "loading" : ""}`} onClick={handleQuestions} disabled={isLoading("questions")}>
+              <button
+                className={`btn violet ${isLoading("questions") ? "loading" : ""}`}
+                onClick={handleQuestions}
+                disabled={isLoading("questions")}
+              >
                 {isLoading("questions") ? t("Working…", "جاري…") : t("Generate Questions", "إنشاء أسئلة")}
               </button>
 
-              <button className={`btn orange ${isLoading("flashcards") ? "loading" : ""}`} onClick={handleFlashcards} disabled={isLoading("flashcards")}>
+              <button
+                className={`btn orange ${isLoading("flashcards") ? "loading" : ""}`}
+                onClick={handleFlashcards}
+                disabled={isLoading("flashcards")}
+              >
                 {isLoading("flashcards") ? t("Working…", "جاري…") : t("Generate Flashcards", "إنشاء بطاقات")}
               </button>
 
@@ -911,7 +1204,9 @@ function App() {
                 <div className="chatHeader">
                   <div>
                     <div className="hTitle">{t("Chat with selected PDFs", "الدردشة مع الملفات المحددة")}</div>
-                    <div className="hSub">{t("Tip: Ask in Arabic or English — citations stay clean.", "نصيحة: اسأل بالعربي أو الإنجليزي — والاستشهادات ستبقى مرتبة.")}</div>
+                    <div className="hSub">
+                      {t("Tip: Ask in Arabic or English — citations stay clean.", "نصيحة: اسأل بالعربي أو الإنجليزي — والاستشهادات ستبقى مرتبة.")}
+                    </div>
                   </div>
                   <button className="btn ghost" onClick={handleClearChat}>
                     {t("Clear chat", "مسح الدردشة")}
@@ -937,9 +1232,22 @@ function App() {
                           uiLang={uiLang}
                           pending={!!m.pending}
                           onOpenPreview={openPreview}
+                          onCitationClick={(id) => openSource(id)}
+                          onPin={(c) => pinMessage(c)}
+                          onNote={(title, body) => addNoteFrom(title, body)}
                         />
                       );
                     })
+                  )}
+
+                  {isTyping && (
+                    <div className="typingRow">
+                      <div className="typingBubble">
+                        <span className="dot" />
+                        <span className="dot" />
+                        <span className="dot" />
+                      </div>
+                    </div>
                   )}
 
                   <div ref={chatEndRef} />
@@ -961,7 +1269,11 @@ function App() {
                     }}
                     disabled={loadingAction === "chat"}
                   />
-                  <button className={`btn primary bigBtn ${loadingAction === "chat" ? "loading" : ""}`} onClick={handleChatSend} disabled={loadingAction === "chat"}>
+                  <button
+                    className={`btn primary bigBtn ${loadingAction === "chat" ? "loading" : ""}`}
+                    onClick={handleChatSend}
+                    disabled={loadingAction === "chat"}
+                  >
                     {loadingAction === "chat" ? t("Sending…", "جاري الإرسال…") : t("Send", "إرسال")}
                   </button>
                 </div>
@@ -974,12 +1286,21 @@ function App() {
                 <div className="split">
                   <div className="panel">
                     <div className="panelTitle">{t("Extracted / Input Text", "النص المستخرج / المدخل")}</div>
-                    <textarea className="bigText" value={text} onChange={(e) => setText(e.target.value)} placeholder={t("Paste notes here…", "الصق ملاحظاتك هنا…")} />
+                    <textarea
+                      className="bigText"
+                      value={text}
+                      onChange={(e) => setText(e.target.value)}
+                      placeholder={t("Paste notes here…", "الصق ملاحظاتك هنا…")}
+                    />
                   </div>
 
                   <div className="panel">
                     <div className="panelTitle">
-                      {tab === "summary" ? t("Summary", "الملخص") : tab === "questions" ? t("Questions", "الأسئلة") : t("Flashcards", "البطاقات")}
+                      {tab === "summary"
+                        ? t("Summary", "الملخص")
+                        : tab === "questions"
+                        ? t("Questions", "الأسئلة")
+                        : t("Flashcards", "البطاقات")}
                     </div>
 
                     <div className="outputBox" dir={uiLang === "ar" ? "rtl" : "ltr"}>
@@ -1019,9 +1340,140 @@ function App() {
           </section>
 
           <footer className="footer">
-            <div className="footNote">{t("Pro tip: Upload multiple PDFs then select them to compare concepts.", "نصيحة: ارفع عدة ملفات ثم حددها للمقارنة بين المفاهيم.")}</div>
+            <div className="footNote">
+              {t(
+                "Pro tip: Upload multiple PDFs then select them to compare concepts.",
+                "نصيحة: ارفع عدة ملفات ثم حددها للمقارنة بين المفاهيم."
+              )}
+            </div>
           </footer>
         </section>
+
+        {/* Workspace / Evidence */}
+        {!focusMode && (
+          <aside className="right">
+            <section className="card">
+              <div className="cardHeader">
+                <div className="cardTitle">{t("Workspace", "مساحة العمل")}</div>
+                <div className="cardHint">{t("Ctrl+K for actions", "Ctrl+K للأوامر")}</div>
+              </div>
+
+              <div className="quickRow">
+                <button className="btn ghost" onClick={() => setTab("summary")}>
+                  {t("Summary", "الملخص")}
+                </button>
+                <button className="btn ghost" onClick={() => setTab("questions")}>
+                  {t("Questions", "الأسئلة")}
+                </button>
+                <button className="btn ghost" onClick={() => setTab("flashcards")}>
+                  {t("Flashcards", "البطاقات")}
+                </button>
+              </div>
+
+              <div className="wsBlock">
+                <div className="wsTitle">{t("Evidence", "المصادر")}</div>
+
+                {activeSource ? (
+                  <div className="wsCard">
+                    <div className="wsMeta">
+                      <span className="badge" dir="ltr">{activeSource.id}</span>
+                      <span className="badge subtle">
+                        {uiLang === "ar" ? `صفحة ${activeSource.page}` : `Page ${activeSource.page}`}
+                      </span>
+                      <span className="badge subtle file" title={activeSource.filename}>
+                        {activeSource.filename}
+                      </span>
+                    </div>
+                    <div className="wsExcerpt">{activeSource.excerpt}</div>
+                    <div className="wsActions">
+                      <button
+                        className="tinyBtn"
+                        onClick={() =>
+                          setPreview({
+                            open: true,
+                            doc_id: activeSource.doc_id,
+                            filename: activeSource.filename,
+                            page: activeSource.page,
+                          })
+                        }
+                      >
+                        {t("Open page", "فتح الصفحة")}
+                      </button>
+                      <button
+                        className="tinyBtn"
+                        onClick={() => navigator.clipboard.writeText(activeSource.excerpt || "")}
+                      >
+                        {t("Copy", "نسخ")}
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="wsEmpty">
+                    {t(
+                      "Click a citation like [S1] to view the evidence here.",
+                      "اضغط على استشهاد مثل [S1] لعرض المصدر هنا."
+                    )}
+                  </div>
+                )}
+              </div>
+
+              <div className="wsBlock">
+                <div className="wsTitle">{t("Pinned", "مثبّت")}</div>
+                {pinned.length === 0 ? (
+                  <div className="wsEmpty">
+                    {t("Pin key answers so you can revisit them quickly.", "ثبّت الإجابات المهمة للرجوع لها بسرعة.")}
+                  </div>
+                ) : (
+                  <div className="wsList">
+                    {pinned.slice(0, 5).map((p) => (
+                      <div key={p.id} className="wsItem">
+                        <div className="wsItemText">{p.content}</div>
+                        <button
+                          className="tinyBtn danger"
+                          onClick={() => setPinned((x) => x.filter((y) => y.id !== p.id))}
+                        >
+                          {t("Remove", "إزالة")}
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div className="wsBlock">
+                <div className="wsTitle">{t("Notes", "ملاحظات")}</div>
+                {notes.length === 0 ? (
+                  <div className="wsEmpty">
+                    {t("Save summaries or answers here. Great for revision.", "احفظ الملخصات أو الإجابات هنا للمراجعة.")}
+                  </div>
+                ) : (
+                  <div className="wsList">
+                    {notes.slice(0, 5).map((n) => (
+                      <div key={n.id} className="wsItem">
+                        <div className="wsItemHead">{n.title}</div>
+                        <div className="wsItemText">{n.body}</div>
+                        <div className="wsActions">
+                          <button
+                            className="tinyBtn"
+                            onClick={() => navigator.clipboard.writeText(`${n.title}\n\n${n.body}`)}
+                          >
+                            {t("Copy", "نسخ")}
+                          </button>
+                          <button
+                            className="tinyBtn danger"
+                            onClick={() => setNotes((x) => x.filter((y) => y.id !== n.id))}
+                          >
+                            {t("Delete", "حذف")}
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </section>
+          </aside>
+        )}
       </main>
     </div>
   );
@@ -1054,13 +1506,31 @@ function SkeletonLine({ w }) {
   return <div className="skLineOut" style={{ width: w || "100%" }} />;
 }
 
-function ChatBubble({ role, content, sources, dir, uiLang, pending, onOpenPreview }) {
+function ChatBubble({
+  role,
+  content,
+  sources,
+  dir,
+  uiLang,
+  pending,
+  onOpenPreview,
+  onCitationClick,
+  onPin,
+  onNote,
+}) {
   const [open, setOpen] = useState(false);
   const isUser = role === "user";
-  const title = isUser ? (uiLang === "ar" ? "أنت" : "You") : uiLang === "ar" ? "المساعد" : "Assistant";
+  const title = isUser
+    ? uiLang === "ar"
+      ? "أنت"
+      : "You"
+    : uiLang === "ar"
+    ? "المساعد"
+    : "Assistant";
 
-  const lines = (content || "").split("\n").filter((x) => x.trim().length > 0);
-  const messageLangDir = dir;
+  const lines = (content || "")
+    .split("\n")
+    .filter((x) => x.trim().length > 0);
 
   const hasSources = Array.isArray(sources) && sources.length > 0;
 
@@ -1072,14 +1542,47 @@ function ChatBubble({ role, content, sources, dir, uiLang, pending, onOpenPrevie
 
   return (
     <div className={`bubbleRow ${isUser ? "user" : "assistant"}`}>
-      <div className={`bubble ${isUser ? "user" : "assistant"}`} dir={messageLangDir}>
+      <div className={`bubble ${isUser ? "user" : "assistant"}`} dir={dir}>
         <div className="bubbleTop">
           <span className="bubbleTitle">{title}</span>
 
           {!isUser && hasSources && !pending && (
             <button className="miniLink" onClick={() => setOpen((v) => !v)}>
-              {open ? (uiLang === "ar" ? "إخفاء المصادر" : "Hide sources") : uiLang === "ar" ? `عرض المصادر (${sources.length})` : `Show sources (${sources.length})`}
+              {open
+                ? uiLang === "ar"
+                  ? "إخفاء المصادر"
+                  : "Hide sources"
+                : uiLang === "ar"
+                ? `عرض المصادر (${sources.length})`
+                : `Show sources (${sources.length})`}
             </button>
+          )}
+
+          {!isUser && !pending && (
+            <div className="bubbleActions">
+              <button className="miniLink" onClick={() => copyText(content || "")}>
+                {uiLang === "ar" ? "نسخ" : "Copy"}
+              </button>
+              <button
+                className="miniLink"
+                onClick={() => onPin?.((content || "").trim())}
+                disabled={!onPin || !(content || "").trim()}
+              >
+                {uiLang === "ar" ? "تثبيت" : "Pin"}
+              </button>
+              <button
+                className="miniLink"
+                onClick={() =>
+                  onNote?.(
+                    uiLang === "ar" ? "ملاحظة من الدردشة" : "Chat note",
+                    (content || "").trim()
+                  )
+                }
+                disabled={!onNote || !(content || "").trim()}
+              >
+                {uiLang === "ar" ? "ملاحظة" : "Note"}
+              </button>
+            </div>
           )}
         </div>
 
@@ -1092,12 +1595,22 @@ function ChatBubble({ role, content, sources, dir, uiLang, pending, onOpenPrevie
             </div>
           ) : (
             lines.map((line, idx) => {
-              const isBullet = line.trim().startsWith("•") || line.trim().startsWith("- ");
+              const isBullet =
+                line.trim().startsWith("•") || line.trim().startsWith("- ");
               const isHeading =
-                line.includes("الخلاصة") || line.includes("Summary") || line.includes("المصادر") || line.includes("Sources");
+                line.includes("الخلاصة") ||
+                line.includes("Summary") ||
+                line.includes("المصادر") ||
+                line.includes("Sources");
+
               return (
-                <div key={idx} className={`line ${isBullet ? "bullet" : ""} ${isHeading ? "heading" : ""}`}>
-                  {renderWithCitations(line, messageLangDir)}
+                <div
+                  key={idx}
+                  className={`line ${isBullet ? "bullet" : ""} ${
+                    isHeading ? "heading" : ""
+                  }`}
+                >
+                  {renderWithCitations(line, dir, onCitationClick)}
                 </div>
               );
             })
@@ -1114,7 +1627,9 @@ function ChatBubble({ role, content, sources, dir, uiLang, pending, onOpenPrevie
                     <span className="badge" dir="ltr">
                       {s.id}
                     </span>
-                    <span className="badge subtle">{uiLang === "ar" ? `صفحة ${s.page}` : `Page ${s.page}`}</span>
+                    <span className="badge subtle">
+                      {uiLang === "ar" ? `صفحة ${s.page}` : `Page ${s.page}`}
+                    </span>
                     <span className="badge subtle file" title={s.filename}>
                       {s.filename}
                     </span>
